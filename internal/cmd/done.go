@@ -604,7 +604,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 							closeReason = fmt.Sprintf("%s\nskip_verify: true\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)
 						}
 					} else if !isNoMergeTask {
-						if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
+						if verifyErr := g.VerifyCommitOnRemoteBranch("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
 							noteVerifiedPushFailure(cwd, issueID, defaultBranch, noMRCommitSHA, verifyErr)
 							return fmt.Errorf("cannot close no-MR code bead: %w", verifyErr)
 						}
@@ -708,7 +708,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			directCommitSHA, _ := g.Rev("HEAD")
 			if doneSkipVerify {
 				noteVerifiedPushSkipped(cwd, issueID, defaultBranch, directCommitSHA, "--skip-verify on direct merge")
-			} else if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, directCommitSHA); verifyErr != nil {
+			} else if verifyErr := g.VerifyCommitOnRemoteBranch("origin", defaultBranch, directCommitSHA); verifyErr != nil {
 				pushFailed = true
 				errMsg := verifyErr.Error()
 				doneErrors = append(doneErrors, errMsg)
@@ -983,7 +983,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				lateDirectCommitSHA, _ := g.Rev("HEAD")
 				if doneSkipVerify {
 					noteVerifiedPushSkipped(cwd, issueID, defaultBranch, lateDirectCommitSHA, "--skip-verify on late direct merge")
-				} else if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, lateDirectCommitSHA); verifyErr != nil {
+				} else if verifyErr := g.VerifyCommitOnRemoteBranch("origin", defaultBranch, lateDirectCommitSHA); verifyErr != nil {
 					pushFailed = true
 					errMsg := verifyErr.Error()
 					doneErrors = append(doneErrors, errMsg)
