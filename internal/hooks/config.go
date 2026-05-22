@@ -279,6 +279,23 @@ func DefaultOverrides() map[string]*HooksConfig {
 				},
 			},
 		},
+		// Boot watchdog: block raw `tmux send-keys` (hq-fzv).
+		// Boot is an ephemeral, stateless watchdog whose only sanctioned way to
+		// reach the Deacon is `gt nudge`, which stages text AND submits it (Enter)
+		// under a serialized lock. A raw `tmux send-keys` from Boot's reasoning can
+		// leave text (e.g. "Stop the patrol loop") staged but UNSUBMITTED in the
+		// Deacon TUI input; a later submit stops town monitoring with no auto-respawn.
+		"boot": {
+			PreToolUse: []HookEntry{
+				{
+					Matcher: "Bash(*tmux send-keys*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Boot must not use raw tmux send-keys. It can leave unsubmitted text staged in the Deacon TUI input, which stops town monitoring if later submitted (hq-fzv).' && echo 'Use: gt nudge deacon \"msg\" — reliable, serialized, always submits.' && exit 2",
+					}},
+				},
+			},
+		},
 		// Deacon roles: patrol-formula-guard (same as witness).
 		// Deacons also run patrols and must use wisps, not persistent molecules.
 		"deacon": {
@@ -417,6 +434,19 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
 		Key:  "deacon",
 		Role: "deacon",
 	})
+
+	// Boot watchdog — ephemeral Claude agent in deacon/dogs/boot/ (hq-fzv).
+	// Only added when the directory exists (gitignored and optional). Adding it
+	// here makes gt hooks sync manage boot's settings.json so the send-keys guard
+	// is applied and preserved.
+	bootDir := filepath.Join(townRoot, "deacon", "dogs", "boot")
+	if info, err := os.Stat(bootDir); err == nil && info.IsDir() {
+		targets = append(targets, Target{
+			Path: filepath.Join(bootDir, ".claude", "settings.json"),
+			Key:  "boot",
+			Role: "boot",
+		})
+	}
 
 	// Scan rigs
 	entries, err := os.ReadDir(townRoot)
