@@ -38,6 +38,20 @@ log() {
   echo "[dolt-backup] $*"
 }
 
+# Resolve a database's HEAD commit hash from the LIVE sql-server.
+#
+# Why not `dolt log`: the CLI reads the on-disk data dir directly, which lags
+# the running sql-server's HEAD. After the compactor rewrites history, the CLI
+# HEAD can sit unchanged for ~1h while the server keeps committing — so the old
+# change-detection saw CURRENT==LAST and silently SKIPPED an actively-changing
+# DB while still reporting success (hq-q7zs). `dolt sql` auto-connects to the
+# running server on the same data dir, so it reflects live HEAD.
+get_server_head() {
+  local db_dir="$1"
+  ( cd "$db_dir" && dolt sql -q "SELECT hashof('HEAD')" --result-format csv 2>/dev/null ) \
+    | tail -n +2 | head -1 | tr -d '"[:space:]'
+}
+
 # --- Step 1: Discover databases -----------------------------------------------
 
 # Use explicit list if provided, otherwise auto-discover by scanning
@@ -85,10 +99,10 @@ for DB in "${PROD_DBS[@]}"; do
     continue
   fi
 
-  # Get current HEAD hash
-  CURRENT_HASH=$(cd "$DB_DIR" && dolt log -n 1 --oneline 2>/dev/null | head -1 | cut -d' ' -f1 || true)
-  if [[ -z "$CURRENT_HASH" ]]; then
-    log "  $DB: could not get HEAD hash, will sync anyway"
+  # Get current HEAD hash from the live sql-server (NOT the lagging CLI files).
+  CURRENT_HASH=$(get_server_head "$DB_DIR")
+  if [[ -z "$CURRENT_HASH" || "$CURRENT_HASH" == "NULL" ]]; then
+    log "  $DB: could not read server HEAD, will sync anyway"
     CURRENT_HASH="unknown"
   fi
 
