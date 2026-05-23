@@ -14,6 +14,7 @@ import (
 
 	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
@@ -192,7 +193,18 @@ func (b *Boot) spawnTmux(agentOverride string) error {
 		Instructions:  "Run `" + cli.Name() + " boot triage` now.",
 		AgentOverride: agentOverride,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Start nudge-queue poller (hq-0xww). Like the Deacon, Boot is a turn-boundary
+	// agent whose per-turn mail-check drain was disabled by 221f839f, and unlike
+	// witness/refinery nothing else starts a poller for it. Without this its nudge
+	// queue fills and never drains. StartPoller is idempotent across respawns.
+	if _, pollerErr := nudge.StartPoller(b.townRoot, session.BootSessionName()); pollerErr != nil {
+		fmt.Printf("Warning: could not start nudge poller for boot: %v\n", pollerErr)
+	}
+	return nil
 }
 
 // spawnDegraded spawns Boot in degraded mode (no tmux).

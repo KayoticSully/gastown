@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -574,6 +575,17 @@ func startDeaconSession(t *tmux.Tmux, sessionName, agentOverride string) error {
 
 	// Accept startup dialogs (workspace trust + bypass permissions) if they appear.
 	_ = t.AcceptStartupDialogs(sessionName)
+
+	// Start nudge-queue poller (hq-0xww). Commit 221f839f disabled the Deacon's
+	// per-turn `gt mail check --inject` hook to stop Dolt subprocess storms, but
+	// that hook also drained the nudge queue. Unlike witness/refinery (whose
+	// managers call StartPoller), startDeaconSession had no drain, so the queue
+	// filled and never emptied. Mirror the witness/refinery poller — it drains
+	// the file-based queue every 10s without re-introducing the per-turn check.
+	if _, pollerErr := nudge.StartPoller(townRoot, sessionName); pollerErr != nil {
+		fmt.Printf("%s could not start nudge poller for %s: %v\n",
+			style.Warning.Render("⚠"), sessionName, pollerErr)
+	}
 
 	time.Sleep(constants.ShutdownNotifyDelay)
 
