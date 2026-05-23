@@ -11,6 +11,16 @@ RIGS_JSON_PATH="${TOWN_ROOT}/mayor/rigs.json"
 
 log() { echo "[stuck-agent-dog] $*"; }
 
+# Beads/gt routing resolves the database from the cwd's .beads (via routes.jsonl
+# at the town root). The plugin's own directory has no .beads, so gt hook show /
+# bd commands here fail to find the database. Run from the town root so routing
+# works regardless of where the daemon invokes the plugin.
+if [ -z "$TOWN_ROOT" ] || [ ! -d "$TOWN_ROOT" ]; then
+  log "SKIP: town root not resolved (GT_TOWN_ROOT unset and 'gt town root' failed)"
+  exit 0
+fi
+cd "$TOWN_ROOT"
+
 # --- Enumerate agents ---------------------------------------------------------
 
 log "=== Checking agent health ==="
