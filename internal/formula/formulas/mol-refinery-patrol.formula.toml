@@ -1130,13 +1130,17 @@ This must return exactly one bead ID. If it returns zero results, STOP and repor
 Then use await-event to subscribe to the refinery event channel with exponential backoff:
 
 ```bash
-gt mol step await-event --channel refinery --agent-bead YOUR_AGENT_BEAD \
+gt mol step await-event --channel refinery --rig <YOUR_RIG> --agent-bead YOUR_AGENT_BEAD \
   --backoff-base 30s --backoff-mult 2 --backoff-max 15m --cleanup \
   --context-check-interval 5m
 ```
 
+The `--rig <YOUR_RIG>` flag scopes the channel to YOUR rig so you only ever
+consume YOUR rig's events — never another rig's (gt-gyc). It defaults to GT_RIG
+if omitted, which is set on refinery sessions, but pass it explicitly for clarity.
+
 This command:
-1. Watches `~/gt/events/refinery/` for event files (polling-based)
+1. Watches `~/gt/events/<YOUR_RIG>/refinery/` for event files (polling-based)
 2. Returns IMMEDIATELY when an event is emitted (MERGE_READY, PATROL_WAKE, MQ_SUBMIT)
 3. If no events, times out with exponential backoff:
    - First timeout: 30s
