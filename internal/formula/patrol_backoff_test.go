@@ -229,6 +229,58 @@ func TestPatrolFormulasUseDynamicBeadResolution(t *testing.T) {
 	}
 }
 
+// TestPatrolFormulasResolveAgentBeadFromTownDB verifies that the witness and
+// refinery loop steps resolve their agent bead via bd against the TOWN database.
+//
+// Agent beads (gt:agent, owner: mayor) live in the town/hq database, but
+// witness/refinery patrols run from the rig CWD, where bd routes to the rig
+// database and the bd list returns zero results — falsely tripping the
+// "STOP and report an error" gate. Pinning BEADS_DIR to the town .beads keeps
+// the resolution correct regardless of CWD.
+//
+// Regression test for gt-5n3.
+func TestPatrolFormulasResolveAgentBeadFromTownDB(t *testing.T) {
+	patrolFormulas := []string{
+		"mol-witness-patrol.formula.toml",
+		"mol-refinery-patrol.formula.toml",
+	}
+
+	for _, name := range patrolFormulas {
+		t.Run(name, func(t *testing.T) {
+			content, err := formulasFS.ReadFile("formulas/" + name)
+			if err != nil {
+				t.Fatalf("reading %s: %v", name, err)
+			}
+
+			f, err := Parse(content)
+			if err != nil {
+				t.Fatalf("parsing %s: %v", name, err)
+			}
+
+			var loopDesc string
+			for _, step := range f.Steps {
+				if step.ID == "loop-or-exit" || step.ID == "burn-or-loop" {
+					loopDesc = step.Description
+					break
+				}
+			}
+			if loopDesc == "" {
+				t.Fatalf("%s: loop step not found or has empty description", name)
+			}
+
+			// The agent-bead resolution must pin BEADS_DIR to the town .beads so
+			// it targets the town database, not the rig CWD database.
+			if !strings.Contains(loopDesc, `BEADS_DIR="$GT_ROOT/.beads" bd list --label=gt:agent`) {
+				t.Errorf("%s loop step must resolve the agent bead against the town DB\n"+
+					"via `BEADS_DIR=\"$GT_ROOT/.beads\" bd list --label=gt:agent`.\n"+
+					"Without it, the rig CWD routes to the wrong database and returns\n"+
+					"zero results. See gt-5n3.",
+					name)
+			}
+		})
+	}
+}
+
 // TestDeaconPatrolHasHeartbeatSteps verifies the deacon patrol formula
 // includes heartbeat refresh steps to prevent the daemon from killing a
 // healthy Deacon mid-cycle.
