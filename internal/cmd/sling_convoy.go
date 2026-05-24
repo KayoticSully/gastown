@@ -28,7 +28,7 @@ func slingGenerateShortID() string {
 //
 // Uses bdDepListRawIDs for cross-database dep resolution (GH #2624).
 // For direction=up queries, the raw SQL approach queries the same table but
-// looks for rows where depends_on_id matches the beadID, returning the
+// looks for rows where the dependency target matches the beadID, returning the
 // issue_id (which is the convoy). Since this only returns IDs (no issue_type
 // or status), we verify each candidate via bd show.
 func isTrackedByConvoy(beadID string) string {

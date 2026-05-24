@@ -257,7 +257,7 @@ func copyAuxiliaryData(workDir string, result *MigrateWispsResult) error {
 
 	// Copy dependencies
 	if err := bdSQL(workDir,
-		"INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) SELECT d.issue_id, d.depends_on_id, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d INNER JOIN wisps w ON d.issue_id = w.id"); err != nil {
+		"INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external, type, created_at, created_by, metadata, thread_id) SELECT d.issue_id, d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d INNER JOIN wisps w ON d.issue_id = w.id"); err != nil {
 		if !strings.Contains(err.Error(), "nothing") {
 			return fmt.Errorf("copying dependencies: %w", err)
 		}
@@ -457,16 +457,30 @@ var wispAuxTableDDLs = []wispAuxTableDDL{
 	},
 	{
 		name: "wisp_dependencies",
+		// Columns track bd 1.0.4's wisp_dependencies schema: the old polymorphic
+		// single-target column was split into depends_on_issue_id /
+		// depends_on_wisp_id / depends_on_external (gt-c7j). gt only CREATEs this
+		// table on a fresh database (existing DBs are skipped), so matching bd's
+		// current columns prevents reintroducing schema skew. Following the
+		// convention of the other gt-side wisp mirror tables (see wispsCreateDDL),
+		// we omit foreign keys and check constraints — bd owns those on the real
+		// tables; gt's dolt_ignored mirror only needs the columns + indexes.
 		ddl: `CREATE TABLE wisp_dependencies (
+  id char(36) NOT NULL DEFAULT (uuid()),
   issue_id varchar(255) NOT NULL,
-  depends_on_id varchar(255) NOT NULL,
+  depends_on_issue_id varchar(255),
+  depends_on_wisp_id varchar(255),
+  depends_on_external varchar(255),
   type varchar(32) NOT NULL DEFAULT 'blocks',
   created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   created_by varchar(255) NOT NULL DEFAULT '',
   metadata json,
   thread_id varchar(255) DEFAULT '',
-  PRIMARY KEY (issue_id, depends_on_id),
-  KEY idx_wisp_deps_depends_on (depends_on_id)
+  PRIMARY KEY (id),
+  KEY idx_wisp_deps_issue (issue_id),
+  KEY idx_wisp_deps_issue_target (depends_on_issue_id),
+  KEY idx_wisp_deps_wisp_target (depends_on_wisp_id),
+  KEY idx_wisp_deps_external_target (depends_on_external)
 )`,
 	},
 }

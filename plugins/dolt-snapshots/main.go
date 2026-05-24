@@ -382,8 +382,12 @@ func findConvoysNeedingSnapshots(db *sql.DB) ([]convoyRow, error) {
 // discoverConvoyDatabases finds which rig databases a convoy touches
 // by looking at its tracked issues' prefixes.
 func discoverConvoyDatabases(db *sql.DB, convoyID string, databases []string, routes map[string]string) ([]string, error) {
+	// The dependency target was split from the old polymorphic single column
+	// into depends_on_issue_id / depends_on_wisp_id / depends_on_external
+	// (gt-c7j). Convoy "tracks" deps store their target (a cross-db rig bead) in
+	// depends_on_external, so coalesce all three to recover the tracked ID.
 	query := `
-		SELECT DISTINCT d.depends_on_id
+		SELECT DISTINCT COALESCE(d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external)
 		FROM hq.dependencies d
 		WHERE d.issue_id = ? AND d.type = 'tracks'
 	`
