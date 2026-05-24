@@ -191,6 +191,74 @@ func TestIsNothingToCommit(t *testing.T) {
 	}
 }
 
+// reaperSource returns the contents of reaper.go for source-pattern assertions.
+func reaperSource(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile("reaper.go")
+	if err != nil {
+		t.Fatalf("read reaper.go: %v", err)
+	}
+	return string(data)
+}
+
+// reaperFuncBody returns the source of the function whose signature line starts
+// with funcSig, up to (but not including) the next top-level "func " declaration.
+func reaperFuncBody(t *testing.T, funcSig string) string {
+	t.Helper()
+	source := reaperSource(t)
+	start := strings.Index(source, funcSig)
+	if start == -1 {
+		t.Fatalf("could not find %q in reaper.go", funcSig)
+	}
+	rest := source[start+len(funcSig):]
+	if end := strings.Index(rest, "\nfunc "); end != -1 {
+		return source[start : start+len(funcSig)+end]
+	}
+	return source[start:]
+}
+
+// TestNoObsoleteDependsOnIdColumn guards against regression to the obsolete
+// wisp_dependencies/dependencies column depends_on_id. As of 2026-05-24 that
+// polymorphic column was split fleet-wide into depends_on_issue_id +
+// depends_on_wisp_id; the old column is gone, so any reference errors mid-scan
+// (gt-jpr). Note: depends_on_issue_id and depends_on_wisp_id do NOT contain the
+// substring "depends_on_id", so this check only catches the obsolete column.
+func TestNoObsoleteDependsOnIdColumn(t *testing.T) {
+	source := reaperSource(t)
+	if strings.Contains(source, "depends_on_id") {
+		t.Error("reaper.go references obsolete column depends_on_id; " +
+			"port to depends_on_issue_id / depends_on_wisp_id (gt-jpr)")
+	}
+}
+
+// TestParentExcludeJoinUsesSplitColumns verifies the parent-exclusion join uses
+// the new split schema: parent-wisp join on depends_on_wisp_id, parent-issue
+// join on depends_on_issue_id.
+func TestParentExcludeJoinUsesSplitColumns(t *testing.T) {
+	joinClause, _ := parentExcludeJoin("testdb")
+	if !contains(joinClause, "wd.depends_on_wisp_id") {
+		t.Errorf("parentExcludeJoin should join parent wisps on depends_on_wisp_id, got: %s", joinClause)
+	}
+	if !contains(joinClause, "wd.depends_on_issue_id") {
+		t.Errorf("parentExcludeJoin should join parent issues on depends_on_issue_id, got: %s", joinClause)
+	}
+}
+
+// TestHasReaperSchemaVerifiesDependencyColumns verifies that the schema gate
+// also checks wisp_dependencies has the new-schema columns, so a DB on an
+// unexpected schema is skipped (returns false) rather than erroring mid-scan.
+func TestHasReaperSchemaVerifiesDependencyColumns(t *testing.T) {
+	body := reaperFuncBody(t, "func HasReaperSchema(")
+	if !strings.Contains(body, "wisp_dependencies") {
+		t.Error("HasReaperSchema should verify the wisp_dependencies table schema")
+	}
+	for _, col := range []string{"depends_on_issue_id", "depends_on_wisp_id"} {
+		if !strings.Contains(body, col) {
+			t.Errorf("HasReaperSchema should verify wisp_dependencies has column %q", col)
+		}
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
 }

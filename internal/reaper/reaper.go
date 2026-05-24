@@ -203,7 +203,7 @@ func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
 	joinClause = `LEFT JOIN (
 		SELECT DISTINCT wd.issue_id
 		FROM wisp_dependencies wd
-		LEFT JOIN wisps pw ON pw.id = wd.depends_on_id LEFT JOIN issues pi ON pi.id = wd.depends_on_id
+		LEFT JOIN wisps pw ON pw.id = wd.depends_on_wisp_id LEFT JOIN issues pi ON pi.id = wd.depends_on_issue_id
 		WHERE wd.type = 'parent-child'
 		AND (pw.status IN ('open', 'hooked', 'in_progress') OR pi.status IN ('open', 'in_progress'))
 	) open_parent ON open_parent.issue_id = w.id`
@@ -211,21 +211,39 @@ func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
 	return
 }
 
-// HasReaperSchema checks whether the database has the tables required for reaper
-// operations (wisps and issues). Returns false (no error) when tables are missing
-// — callers use this to skip databases that have incomplete beads schema (e.g.
-// partially initialized databases on the central Dolt server).
+// HasReaperSchema checks whether the database has the schema required for reaper
+// operations: the wisps and issues tables must exist, AND wisp_dependencies must
+// carry the current parent-reference columns (depends_on_issue_id +
+// depends_on_wisp_id). Returns false (no error) when the schema is missing or
+// unexpected — callers use this to skip databases rather than erroring mid-scan.
+//
+// The depends_on_wisp_id / depends_on_issue_id columns replaced the obsolete
+// polymorphic parent-reference column (gt-jpr). A database still on the old schema
+// (or with wisp_dependencies missing entirely) is skipped here so reaper SQL
+// never hits a "column does not exist" error partway through a scan.
 func HasReaperSchema(db *sql.DB) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	var count int
+	var tableCount int
 	err := db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM information_schema.tables WHERE table_name IN ('wisps', 'issues') AND table_schema = DATABASE()").Scan(&count)
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_name IN ('wisps', 'issues') AND table_schema = DATABASE()").Scan(&tableCount)
 	if err != nil {
 		return false, fmt.Errorf("check reaper schema: %w", err)
 	}
-	return count >= 2, nil
+	if tableCount < 2 {
+		return false, nil
+	}
+
+	// Verify wisp_dependencies has the new-schema parent-reference columns the
+	// reaper SQL depends on. Skip (return false, no error) if they're absent.
+	var colCount int
+	err = db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'wisp_dependencies' AND table_schema = DATABASE() AND column_name IN ('depends_on_issue_id', 'depends_on_wisp_id')").Scan(&colCount)
+	if err != nil {
+		return false, fmt.Errorf("check wisp_dependencies columns: %w", err)
+	}
+	return colCount >= 2, nil
 }
 
 // Scan counts reaper candidates in a database without modifying anything.
@@ -278,11 +296,11 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 		AND i.issue_type != 'epic'
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM dependencies d
-			INNER JOIN issues dep ON d.depends_on_id = dep.id
+			INNER JOIN issues dep ON d.depends_on_issue_id = dep.id
 			WHERE dep.status IN ('open', 'in_progress')
 		)
 		AND i.id NOT IN (
-			SELECT DISTINCT d.depends_on_id FROM dependencies d
+			SELECT DISTINCT d.depends_on_issue_id FROM dependencies d
 			INNER JOIN issues blocker ON d.issue_id = blocker.id
 			WHERE blocker.status IN ('open', 'in_progress')
 		)`
@@ -302,7 +320,7 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// Anomaly detection: dangling parent references.
 	danglingQuery := `
 		SELECT COUNT(*) FROM wisp_dependencies wd
-		LEFT JOIN wisps pw ON pw.id = wd.depends_on_id LEFT JOIN issues pi ON pi.id = wd.depends_on_id
+		LEFT JOIN wisps pw ON pw.id = wd.depends_on_wisp_id LEFT JOIN issues pi ON pi.id = wd.depends_on_issue_id
 		WHERE wd.type = 'parent-child' AND pw.id IS NULL AND pi.id IS NULL`
 	var danglingCount int
 	if err := db.QueryRowContext(ctx, danglingQuery).Scan(&danglingCount); err == nil && danglingCount > 0 {
@@ -604,11 +622,11 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM `+"`%s`"+`.dependencies d
-			INNER JOIN `+"`%s`"+`.issues dep ON d.depends_on_id = dep.id
+			INNER JOIN `+"`%s`"+`.issues dep ON d.depends_on_issue_id = dep.id
 			WHERE dep.status IN ('open', 'in_progress')
 		)
 		AND i.id NOT IN (
-			SELECT DISTINCT d.depends_on_id FROM `+"`%s`"+`.dependencies d
+			SELECT DISTINCT d.depends_on_issue_id FROM `+"`%s`"+`.dependencies d
 			INNER JOIN `+"`%s`"+`.issues blocker ON d.issue_id = blocker.id
 			WHERE blocker.status IN ('open', 'in_progress')
 		)`, dbName, dbName, dbName, dbName, dbName)
@@ -747,7 +765,15 @@ func batchDeleteRows(ctx context.Context, db *sql.DB, idQuery string, cutoffArg 
 		}
 
 		// Clean up reverse dependency references to prevent dangling parent refs.
-		delReverse := fmt.Sprintf("DELETE FROM wisp_dependencies WHERE depends_on_id IN %s", inClause)
+		// The old polymorphic parent-reference column was split into depends_on_wisp_id
+		// and depends_on_issue_id (gt-jpr). The reverse-reference column depends on
+		// the type of IDs being deleted: purged wisps are referenced as parents via
+		// depends_on_wisp_id, purged issues via depends_on_issue_id.
+		reverseCol := "depends_on_wisp_id"
+		if primaryTable == "issues" {
+			reverseCol = "depends_on_issue_id"
+		}
+		delReverse := fmt.Sprintf("DELETE FROM wisp_dependencies WHERE %s IN %s", reverseCol, inClause) //nolint:gosec // G201: reverseCol is internal constant
 		if _, err := db.ExecContext(ctx, delReverse, args...); err != nil {
 			// Non-fatal.
 		}
