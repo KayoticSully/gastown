@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
@@ -125,8 +126,16 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 			Sender:    "deacon",
 			Topic:     "assigned",
 		},
-		Instructions:   instructions,
-		AgentOverride:  opts.AgentOverride,
+		Instructions:  instructions,
+		AgentOverride: opts.AgentOverride,
+		// Suppress bd JSONL export/backup/push/auto-import for the dog session.
+		// Dogs run gt-managed formulas (e.g. mol-dog-reaper) that make heavy bd
+		// calls; without this, every direct bd invocation auto-imports the stale
+		// .beads/issues.jsonl over the live Dolt server, reopening reaped beads
+		// and triggering a status-flap commit loop that bloats Dolt history
+		// (gt-414). ExtraEnv overrides AgentEnv and is passed via tmux -e at
+		// session creation, so the dog shell and its bd subprocesses inherit it.
+		ExtraEnv:       beads.SuppressBDSideEffectsMap(),
 		Theme:          &theme,
 		WaitForAgent:   true,
 		WaitFatal:      true,
