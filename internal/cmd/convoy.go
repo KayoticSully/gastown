@@ -469,30 +469,40 @@ func runBdJSON(dir string, args ...string) ([]byte, error) {
 // target issues live in a different Dolt database. See GH #2624.
 //
 // dir should be the town beads directory (.beads) for HQ queries.
-// direction is "down" (issue_id → depends_on_id) or "up" (depends_on_id → issue_id).
+// direction is "down" (issue_id → dependency target) or "up" (target → issue_id).
 // depType filters by dependency type (e.g., "tracks", "blocks"); empty means all types.
 //
 // Returns deduplicated, unwrapped issue IDs (external:prefix:id → id).
+//
+// The dependency target was historically a single polymorphic column. bd 1.0.4
+// split it into three columns, exactly one non-null per row: depends_on_issue_id
+// (same-db issue), depends_on_wisp_id (wisp), or depends_on_external (cross-db
+// ref, stored as a plain ID). We reconstruct the old single-target semantics
+// with COALESCE ("down") and an OR across all three columns ("up"). See gt-c7j.
 func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) {
-	// Determine query columns based on direction.
-	// "down": issueID depends on targets → SELECT depends_on_id WHERE issue_id = ?
-	// "up":   issueID is depended on → SELECT issue_id WHERE depends_on_id = ?
-	var selectCol, whereCol string
-	if direction == "up" {
-		selectCol = "issue_id"
-		whereCol = "depends_on_id"
-	} else {
-		selectCol = "depends_on_id"
-		whereCol = "issue_id"
-	}
-
 	// Build SQL query. Bead IDs are system-generated alphanumeric strings
 	// with hyphens and dots — validate to prevent injection.
 	if !isValidBeadID(issueID) {
 		return nil, fmt.Errorf("invalid bead ID: %q", issueID)
 	}
 
-	query := fmt.Sprintf("SELECT %s FROM dependencies WHERE %s = '%s'", selectCol, whereCol, issueID)
+	// targetCol is the alias the coalesced dependency target is returned under
+	// for "down" queries; "up" queries return the dependent issue_id directly.
+	const targetCol = "dep_target"
+	var selectCol, query string
+	if direction == "up" {
+		// issueID is depended on → SELECT issue_id WHERE any target col = issueID.
+		selectCol = "issue_id"
+		query = fmt.Sprintf(
+			"SELECT issue_id FROM dependencies WHERE (depends_on_issue_id = '%s' OR depends_on_wisp_id = '%s' OR depends_on_external = '%s')",
+			issueID, issueID, issueID)
+	} else {
+		// issueID depends on targets → SELECT the single non-null target column.
+		selectCol = targetCol
+		query = fmt.Sprintf(
+			"SELECT COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) AS %s FROM dependencies WHERE issue_id = '%s'",
+			targetCol, issueID)
+	}
 	if depType != "" {
 		if !isValidBeadID(depType) {
 			return nil, fmt.Errorf("invalid dep type: %q", depType)

@@ -9,6 +9,27 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 )
 
+// TestMisclassifiedWispDepCopyUsesSplitColumns guards the dependency-copy
+// query (issues → wisp_dependencies during misclassified-wisp repair) against
+// the obsolete polymorphic depends_on_id column. bd 1.0.4 split it into
+// depends_on_issue_id / depends_on_wisp_id / depends_on_external (gt-c7j); the
+// copy must carry all three target columns 1:1.
+func TestMisclassifiedWispDepCopyUsesSplitColumns(t *testing.T) {
+	data, err := os.ReadFile("misclassified_wisp_check.go")
+	if err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+	src := string(data)
+	if strings.Contains(src, "depends_on_id") {
+		t.Error("misclassified_wisp_check.go references obsolete column depends_on_id (gt-c7j)")
+	}
+	for _, want := range []string{"depends_on_issue_id", "depends_on_wisp_id", "depends_on_external"} {
+		if !strings.Contains(src, want) {
+			t.Errorf("dependency-copy query should carry split column %q", want)
+		}
+	}
+}
+
 // TestFixWorkDir_HQ verifies that Fix() resolves the "hq" rig name to the
 // town root directory, not townRoot/hq. When the Dolt detection path finds
 // misplaced ephemerals in the "hq" database, the rigName is "hq" — Fix() must
