@@ -31,7 +31,9 @@ func TestNotifyMayorSlotOpen_BlocksNonCompletedExit(t *testing.T) {
 
 	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeDeferred))
 
-	events, err := filepath.Glob(filepath.Join(townRoot, "events", "mayor", "*.event"))
+	// Events are rig-scoped (gt-gyc): gastown's mayor events live under
+	// events/gastown/mayor/, not the shared events/mayor/.
+	events, err := filepath.Glob(filepath.Join(townRoot, "events", "gastown", "mayor", "*.event"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2032,8 +2034,9 @@ func TestNotifyRefineryMergeReady_EmitsChannelEvent(t *testing.T) {
 	// notifyRefineryMergeReady takes workDir and calls workspace.Find(workDir) internally
 	notifyRefineryMergeReady(townRoot, "dashboard", result)
 
-	// Verify that a MERGE_READY event file was created in the refinery channel
-	eventDir := filepath.Join(townRoot, "events", "refinery")
+	// Verify that a MERGE_READY event file was created in the rig-scoped
+	// refinery channel (gt-gyc): events/<rig>/refinery/, not events/refinery/.
+	eventDir := filepath.Join(townRoot, "events", "dashboard", "refinery")
 	entries, err := os.ReadDir(eventDir)
 	if err != nil {
 		t.Fatalf("reading event dir: %v", err)
@@ -2047,7 +2050,7 @@ func TestNotifyRefineryMergeReady_EmitsChannelEvent(t *testing.T) {
 	}
 
 	if len(eventFiles) == 0 {
-		t.Fatal("expected at least one .event file in ~/gt/events/refinery/, got none")
+		t.Fatal("expected at least one .event file in ~/gt/events/dashboard/refinery/, got none")
 	}
 
 	// Read and verify the event content
@@ -2066,6 +2069,9 @@ func TestNotifyRefineryMergeReady_EmitsChannelEvent(t *testing.T) {
 	}
 	if event["channel"] != "refinery" {
 		t.Errorf("event channel = %v, want refinery", event["channel"])
+	}
+	if event["rig"] != "dashboard" {
+		t.Errorf("event rig = %v, want dashboard", event["rig"])
 	}
 
 	payload, ok := event["payload"].(map[string]interface{})

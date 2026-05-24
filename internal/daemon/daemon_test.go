@@ -545,14 +545,14 @@ func TestIsRunningFromPID_LiveProcess(t *testing.T) {
 
 func TestHasPendingEvents_EmptyDir(t *testing.T) {
 	tmpDir := t.TempDir()
-	eventDir := filepath.Join(tmpDir, "events", "refinery")
+	eventDir := filepath.Join(tmpDir, "events", "gastown", "refinery")
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected false for empty event directory")
 	}
 }
@@ -562,14 +562,14 @@ func TestHasPendingEvents_MissingDir(t *testing.T) {
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected false when event directory doesn't exist")
 	}
 }
 
 func TestHasPendingEvents_WithEventFiles(t *testing.T) {
 	tmpDir := t.TempDir()
-	eventDir := filepath.Join(tmpDir, "events", "refinery")
+	eventDir := filepath.Join(tmpDir, "events", "gastown", "refinery")
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -582,14 +582,37 @@ func TestHasPendingEvents_WithEventFiles(t *testing.T) {
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if !d.hasPendingEvents("refinery") {
+	if !d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected true when .event files exist")
+	}
+}
+
+// TestHasPendingEvents_RigScoped verifies the daemon's spawn gate is rig-aware
+// (gt-gyc): an event for one rig must NOT cause another rig's gate to fire, or
+// the daemon would spawn the wrong rig's refinery.
+func TestHasPendingEvents_RigScoped(t *testing.T) {
+	tmpDir := t.TempDir()
+	gastownDir := filepath.Join(tmpDir, "events", "gastown", "refinery")
+	if err := os.MkdirAll(gastownDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gastownDir, "1-1-1.event"), []byte(`{"type":"MQ_SUBMIT"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{config: &Config{TownRoot: tmpDir}}
+
+	if !d.hasPendingEvents("gastown", "refinery") {
+		t.Error("gastown should have a pending event")
+	}
+	if d.hasPendingEvents("beads", "refinery") {
+		t.Error("beads must NOT see gastown's pending event (cross-rig leak)")
 	}
 }
 
 func TestHasPendingEvents_IgnoresNonEventFiles(t *testing.T) {
 	tmpDir := t.TempDir()
-	eventDir := filepath.Join(tmpDir, "events", "refinery")
+	eventDir := filepath.Join(tmpDir, "events", "gastown", "refinery")
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -601,7 +624,7 @@ func TestHasPendingEvents_IgnoresNonEventFiles(t *testing.T) {
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected false when only non-.event files exist")
 	}
 }
