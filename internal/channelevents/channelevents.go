@@ -1,9 +1,15 @@
 // Package channelevents provides file-based event emission for named channels.
 //
-// Channel events are JSON files written to ~/gt/events/<channel>/*.event
+// Channel events are JSON files written to ~/gt/events/<rig>/<channel>/*.event
 // and consumed by await-event subscribers (e.g., the refinery watching for
 // MERGE_READY events). This is distinct from the activity feed events in
 // the events package (~/gt/.events.jsonl).
+//
+// Channels are rig-scoped (gt-gyc): each rig's events live under their own
+// directory so a refinery (or any await-event --cleanup consumer) in one rig
+// cannot consume — and delete — events addressed to another rig. Callers that
+// genuinely cannot resolve a rig may pass an empty rig, which falls back to the
+// legacy unscoped ~/gt/events/<channel>/ path.
 package channelevents
 
 import (
@@ -26,11 +32,39 @@ var ValidChannelName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 // time.Now().UnixNano() has low resolution.
 var emitSeq atomic.Uint64
 
-// Emit creates an event file in the channel directory, resolving the town
-// root from the current working directory.
-func Emit(channel, eventType string, payloadPairs []string) (string, error) {
+// EventDir returns the directory that holds events for a (rig, channel) pair
+// under a town root. Events are rig-scoped to ~/gt/events/<rig>/<channel>/ so
+// that an await-event consumer in one rig cannot read or --cleanup events
+// addressed to another (gt-gyc). An empty rig falls back to the legacy
+// unscoped ~/gt/events/<channel>/ path for callers that cannot resolve a rig.
+//
+// Producers and consumers MUST agree on the rig string for events to be
+// delivered; in practice the rig comes from GT_RIG (set on refinery/witness
+// sessions) on both sides.
+func EventDir(townRoot, rig, channel string) string {
+	if rig == "" {
+		return filepath.Join(townRoot, "events", channel)
+	}
+	return filepath.Join(townRoot, "events", rig, channel)
+}
+
+// validateNames checks the channel (required) and rig (optional) names against
+// the safe-character pattern to prevent path traversal.
+func validateNames(rig, channel string) error {
 	if !ValidChannelName.MatchString(channel) {
-		return "", fmt.Errorf("invalid channel name %q: must match [a-zA-Z0-9_-]", channel)
+		return fmt.Errorf("invalid channel name %q: must match [a-zA-Z0-9_-]", channel)
+	}
+	if rig != "" && !ValidChannelName.MatchString(rig) {
+		return fmt.Errorf("invalid rig name %q: must match [a-zA-Z0-9_-]", rig)
+	}
+	return nil
+}
+
+// Emit creates an event file in the rig-scoped channel directory, resolving the
+// town root from the current working directory.
+func Emit(rig, channel, eventType string, payloadPairs []string) (string, error) {
+	if err := validateNames(rig, channel); err != nil {
+		return "", err
 	}
 
 	townRoot, err := workspace.FindFromCwd()
@@ -38,32 +72,32 @@ func Emit(channel, eventType string, payloadPairs []string) (string, error) {
 		home, _ := os.UserHomeDir()
 		townRoot = filepath.Join(home, "gt")
 	}
-	eventDir := filepath.Join(townRoot, "events", channel)
+	eventDir := EventDir(townRoot, rig, channel)
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		return "", fmt.Errorf("creating event directory: %w", err)
 	}
 
-	return emitToDir(eventDir, channel, eventType, payloadPairs)
+	return emitToDir(eventDir, rig, channel, eventType, payloadPairs)
 }
 
 // EmitToTown creates an event file using an explicit town root.
 // Used by internal callers that already know the town root.
-func EmitToTown(townRoot, channel, eventType string, payloadPairs []string) (string, error) {
-	if !ValidChannelName.MatchString(channel) {
-		return "", fmt.Errorf("invalid channel name %q: must match [a-zA-Z0-9_-]", channel)
+func EmitToTown(townRoot, rig, channel, eventType string, payloadPairs []string) (string, error) {
+	if err := validateNames(rig, channel); err != nil {
+		return "", err
 	}
 
-	eventDir := filepath.Join(townRoot, "events", channel)
+	eventDir := EventDir(townRoot, rig, channel)
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		return "", fmt.Errorf("creating event directory: %w", err)
 	}
-	return emitToDir(eventDir, channel, eventType, payloadPairs)
+	return emitToDir(eventDir, rig, channel, eventType, payloadPairs)
 }
 
 // emitToDir writes an event file to the given directory.
-func emitToDir(eventDir, channel, eventType string, payloadPairs []string) (string, error) {
-	if !ValidChannelName.MatchString(channel) {
-		return "", fmt.Errorf("invalid channel name %q: must match [a-zA-Z0-9_-]", channel)
+func emitToDir(eventDir, rig, channel, eventType string, payloadPairs []string) (string, error) {
+	if err := validateNames(rig, channel); err != nil {
+		return "", err
 	}
 
 	payload := make(map[string]string)
@@ -78,6 +112,7 @@ func emitToDir(eventDir, channel, eventType string, payloadPairs []string) (stri
 	event := map[string]interface{}{
 		"type":      eventType,
 		"channel":   channel,
+		"rig":       rig,
 		"timestamp": now.Format(time.RFC3339),
 		"payload":   payload,
 	}
