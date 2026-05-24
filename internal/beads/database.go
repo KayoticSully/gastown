@@ -146,31 +146,46 @@ func stripBDCommandFlags(args []string) []string {
 	return args
 }
 
+// suppressBDSideEffectEnv is the canonical, ordered set of environment variables
+// that disable Beads' JSONL export/backup/push/auto-import side effects. It is the
+// single source of truth shared by SuppressBDSideEffects (process env slices) and
+// SuppressBDSideEffectsMap (env maps, e.g. tmux session ExtraEnv).
+var suppressBDSideEffectEnv = []struct{ Key, Value string }{
+	{"BEADS_NO_AUTO_IMPORT", "1"},
+	{"BD_EXPORT_AUTO", "false"},
+	{"BD_BACKUP_ENABLED", "false"},
+	{"BD_DOLT_AUTO_PUSH", "false"},
+	{"BD_NO_PUSH", "true"},
+	{"BD_EXPORT_GIT_ADD", "false"},
+	{"BD_NO_GIT_OPS", "true"},
+}
+
 // SuppressBDSideEffects disables Beads JSONL export/backup/push side effects for
 // Gas Town-managed subprocesses. The authoritative data plane is Dolt; exporting
 // JSONL from high-frequency gt callers re-invalidates Beads' import freshness
 // checks and can create a self-feeding Dolt load loop.
 func SuppressBDSideEffects(env []string) []string {
-	for _, key := range []string{
-		"BEADS_NO_AUTO_IMPORT",
-		"BD_EXPORT_AUTO",
-		"BD_BACKUP_ENABLED",
-		"BD_DOLT_AUTO_PUSH",
-		"BD_NO_PUSH",
-		"BD_EXPORT_GIT_ADD",
-		"BD_NO_GIT_OPS",
-	} {
-		env = stripEnvKey(env, key)
+	for _, kv := range suppressBDSideEffectEnv {
+		env = stripEnvKey(env, kv.Key)
 	}
-	return append(env,
-		"BEADS_NO_AUTO_IMPORT=1",
-		"BD_EXPORT_AUTO=false",
-		"BD_BACKUP_ENABLED=false",
-		"BD_DOLT_AUTO_PUSH=false",
-		"BD_NO_PUSH=true",
-		"BD_EXPORT_GIT_ADD=false",
-		"BD_NO_GIT_OPS=true",
-	)
+	for _, kv := range suppressBDSideEffectEnv {
+		env = append(env, kv.Key+"="+kv.Value)
+	}
+	return env
+}
+
+// SuppressBDSideEffectsMap returns the same suppression vars as
+// SuppressBDSideEffects, but as a map for callers that build environment maps
+// rather than process env slices — e.g. a tmux agent session's ExtraEnv. Dog
+// sessions use this so their direct bd calls (and the bd subprocesses spawned by
+// gt-managed formulas like mol-dog-reaper) don't auto-import the stale
+// .beads/issues.jsonl over the live Dolt server (gt-414).
+func SuppressBDSideEffectsMap() map[string]string {
+	m := make(map[string]string, len(suppressBDSideEffectEnv))
+	for _, kv := range suppressBDSideEffectEnv {
+		m[kv.Key] = kv.Value
+	}
+	return m
 }
 
 func forceBDReadOnly(env []string) []string {

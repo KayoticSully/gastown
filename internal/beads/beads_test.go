@@ -215,6 +215,36 @@ func TestSuppressBDSideEffectsOverridesInherited(t *testing.T) {
 	}
 }
 
+func TestSuppressBDSideEffectsMapMatchesSlice(t *testing.T) {
+	want := map[string]string{
+		"BEADS_NO_AUTO_IMPORT": "1",
+		"BD_EXPORT_AUTO":       "false",
+		"BD_BACKUP_ENABLED":    "false",
+		"BD_DOLT_AUTO_PUSH":    "false",
+		"BD_NO_PUSH":           "true",
+		"BD_EXPORT_GIT_ADD":    "false",
+		"BD_NO_GIT_OPS":        "true",
+	}
+
+	got := SuppressBDSideEffectsMap()
+	if len(got) != len(want) {
+		t.Fatalf("SuppressBDSideEffectsMap() has %d keys, want %d: %v", len(got), len(want), got)
+	}
+	for key, value := range want {
+		if got[key] != value {
+			t.Fatalf("SuppressBDSideEffectsMap()[%q] = %q, want %q", key, got[key], value)
+		}
+	}
+
+	// The map and slice forms must stay in sync (single source of truth).
+	slice := envMap(SuppressBDSideEffects([]string{"PATH=/usr/bin"}))
+	for key, value := range want {
+		if slice[key] != value {
+			t.Fatalf("SuppressBDSideEffects()[%q] = %q, want %q (out of sync with map)", key, slice[key], value)
+		}
+	}
+}
+
 func TestBuildReadOnlyBDEnvForcesReadOnly(t *testing.T) {
 	beadsDir := filepath.Join(t.TempDir(), ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
