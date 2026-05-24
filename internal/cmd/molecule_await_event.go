@@ -160,25 +160,25 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 	var backoffUntil time.Time
 	var beadsDir string
 	if awaitEventAgentBead != "" {
-		workDir, wdErr := findLocalBeadsDir()
-		if wdErr == nil {
-			beadsDir = beads.ResolveBeadsDir(workDir)
-			labels, labErr := getAgentLabels(awaitEventAgentBead, beadsDir)
-			if labErr != nil {
-				if !awaitEventQuiet {
-					fmt.Printf("%s Could not read agent bead (starting at idle=0): %v\n",
-						style.Dim.Render("⚠"), labErr)
+		// Agent beads (gt:agent, owner: mayor) live in the town/hq database —
+		// resolve against the town root, not the rig CWD, or heartbeat/idle/backoff
+		// persistence hits the wrong DB and silently fails (gt-5n3).
+		beadsDir = beads.ResolveBeadsDir(townRoot)
+		labels, labErr := getAgentLabels(awaitEventAgentBead, beadsDir)
+		if labErr != nil {
+			if !awaitEventQuiet {
+				fmt.Printf("%s Could not read agent bead (starting at idle=0): %v\n",
+					style.Dim.Render("⚠"), labErr)
+			}
+		} else {
+			if idleStr, ok := labels["idle"]; ok {
+				if n, parseErr := parseIntSimple(idleStr); parseErr == nil {
+					idleCycles = n
 				}
-			} else {
-				if idleStr, ok := labels["idle"]; ok {
-					if n, parseErr := parseIntSimple(idleStr); parseErr == nil {
-						idleCycles = n
-					}
-				}
-				if untilStr, ok := labels["backoff-until"]; ok {
-					if ts, parseErr := parseIntSimple(untilStr); parseErr == nil && ts > 0 {
-						backoffUntil = time.Unix(int64(ts), 0)
-					}
+			}
+			if untilStr, ok := labels["backoff-until"]; ok {
+				if ts, parseErr := parseIntSimple(untilStr); parseErr == nil && ts > 0 {
+					backoffUntil = time.Unix(int64(ts), 0)
 				}
 			}
 		}

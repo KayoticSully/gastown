@@ -133,19 +133,16 @@ func init() {
 }
 
 func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
-	// Find beads directory (rig-local for bead operations)
-	workDir, err := findLocalBeadsDir()
-	if err != nil {
-		return fmt.Errorf("not in a beads workspace: %w", err)
-	}
-
-	// Find town root for events file (events are always at <townRoot>/.events.jsonl)
+	// Find town root. Events live at <townRoot>/.events.jsonl, and agent beads
+	// (gt:agent, owner: mayor) live in the town/hq database — both resolve against
+	// the town root, not the rig CWD, or agent-bead heartbeats hit the wrong DB
+	// and persistence silently fails (gt-5n3).
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	beadsDir := beads.ResolveBeadsDir(workDir)
+	beadsDir := beads.ResolveBeadsDir(townRoot)
 
 	// Read current idle cycles and backoff window from agent bead (if specified)
 	var idleCycles int
@@ -456,7 +453,9 @@ func updateAgentHeartbeat(agentBead, beadsDir string) error {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	// Pin BEADS_DIR (and strip inherited bd target selectors) so the agent bead
+	// is resolved against the town database regardless of CWD/env (gt-5n3).
+	cmd.Env = beads.BuildPinnedBDEnv(os.Environ(), beadsDir)
 	return cmd.Run()
 }
 
@@ -492,7 +491,9 @@ func setAgentIdleCycles(agentBead, beadsDir string, cycles int) error {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	// Pin BEADS_DIR (and strip inherited bd target selectors) so the agent bead
+	// is resolved against the town database regardless of CWD/env (gt-5n3).
+	cmd.Env = beads.BuildPinnedBDEnv(os.Environ(), beadsDir)
 
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("setting idle label: %w", err)
@@ -528,7 +529,9 @@ func setAgentBackoffUntil(agentBead, beadsDir string, until time.Time) error {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	// Pin BEADS_DIR (and strip inherited bd target selectors) so the agent bead
+	// is resolved against the town database regardless of CWD/env (gt-5n3).
+	cmd.Env = beads.BuildPinnedBDEnv(os.Environ(), beadsDir)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("setting backoff-until label: %w", err)
 	}
@@ -570,7 +573,9 @@ func clearAgentBackoffUntil(agentBead, beadsDir string) error {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	// Pin BEADS_DIR (and strip inherited bd target selectors) so the agent bead
+	// is resolved against the town database regardless of CWD/env (gt-5n3).
+	cmd.Env = beads.BuildPinnedBDEnv(os.Environ(), beadsDir)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("clearing backoff-until label: %w", err)
 	}

@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 var (
@@ -94,15 +95,11 @@ type agentStateResult struct {
 func runAgentState(cmd *cobra.Command, args []string) error {
 	agentBead := args[0]
 
-	// Find beads directory
-	cwd, err := os.Getwd()
+	// Agent beads live in the town/hq database — resolve against the town root,
+	// not the rig CWD, or the lookup hits the wrong database (gt-5n3).
+	beadsDir, err := resolveAgentBeadsDir()
 	if err != nil {
-		return fmt.Errorf("getting working directory: %w", err)
-	}
-
-	beadsDir := beads.ResolveBeadsDir(cwd)
-	if beadsDir == "" {
-		return fmt.Errorf("not in a beads workspace")
+		return err
 	}
 
 	// Determine operation mode
@@ -218,9 +215,10 @@ func modifyAgentState(agentBead, beadsDir string, hasIncr bool) error {
 		args = append(args, "--set-labels=")
 	}
 
-	// Execute bd update
+	// Execute bd update. Pin BEADS_DIR (and strip inherited bd target selectors)
+	// so the town database is targeted regardless of CWD or inherited env (gt-5n3).
 	cmd := exec.Command("bd", args...)
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	cmd.Env = beads.BuildPinnedBDEnv(os.Environ(), beadsDir)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -236,6 +234,19 @@ func modifyAgentState(agentBead, beadsDir string, hasIncr bool) error {
 	fmt.Printf("%s Updated agent state for %s\n", style.Bold.Render("✓"), agentBead)
 
 	return nil
+}
+
+// resolveAgentBeadsDir returns the .beads directory of the TOWN database, where
+// agent beads (labeled gt:agent, owner: mayor) live regardless of which rig the
+// caller runs from. CWD-based resolution (beads.ResolveBeadsDir of the cwd)
+// routes to the rig database, where agent beads do not exist, so heartbeat/idle/
+// backoff persistence silently fails with "no issue found". See gt-5n3.
+func resolveAgentBeadsDir() (string, error) {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return "", fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+	return beads.ResolveBeadsDir(townRoot), nil
 }
 
 // getAgentLabels retrieves state labels from an agent bead.
@@ -273,7 +284,7 @@ func getAllAgentLabels(agentBead, beadsDir string) ([]string, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	cmd.Env = beads.BuildPinnedBDEnv(os.Environ(), beadsDir)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
