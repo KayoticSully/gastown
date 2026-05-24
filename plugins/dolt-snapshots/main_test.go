@@ -3,8 +3,30 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// TestConvoyDatabaseDiscoveryUsesSplitColumns guards the convoy-database
+// discovery query against the obsolete polymorphic depends_on_id column. bd
+// 1.0.4 split it into depends_on_issue_id / depends_on_wisp_id /
+// depends_on_external (gt-c7j); convoy "tracks" deps store their target in
+// depends_on_external, so the discovery query must coalesce all three.
+func TestConvoyDatabaseDiscoveryUsesSplitColumns(t *testing.T) {
+	data, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	src := string(data)
+	if strings.Contains(src, "depends_on_id") {
+		t.Error("main.go references obsolete column depends_on_id; port to the split schema (gt-c7j)")
+	}
+	for _, want := range []string{"COALESCE(", "depends_on_issue_id", "depends_on_wisp_id", "depends_on_external"} {
+		if !strings.Contains(src, want) {
+			t.Errorf("main.go convoy discovery query should reference %q", want)
+		}
+	}
+}
 
 func TestSanitizeName(t *testing.T) {
 	tests := []struct {
