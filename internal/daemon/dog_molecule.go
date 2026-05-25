@@ -24,6 +24,7 @@ const (
 type dogMol struct {
 	rootID   string            // Root wisp ID (e.g., "gt-wisp-abc123"), empty if pour failed.
 	stepIDs  map[string]string // step slug -> wisp issue ID
+	rootOnly bool              // true when poured root-only (no child step wisps materialized)
 	bdPath   string
 	townRoot string
 	logger   interface{ Printf(string, ...interface{}) }
@@ -35,13 +36,23 @@ type dogMol struct {
 func (d *Daemon) pourDogMolecule(formulaName string, vars map[string]string) *dogMol {
 	dm := &dogMol{
 		stepIDs:  make(map[string]string),
+		rootOnly: true,
 		bdPath:   d.bdPath,
 		townRoot: d.config.TownRoot,
 		logger:   d.logger,
 	}
 
-	// Build args: bd mol wisp <formula> --var k=v ...
-	args := []string{"mol", "wisp", formulaName}
+	// Build args: bd mol wisp <formula> --root-only --var k=v ...
+	//
+	// --root-only creates the molecule root WITHOUT materializing a child wisp
+	// per formula step. Daemon dogs do their actual work in Go and use the
+	// molecule purely for observability, so materialized step wisps add no
+	// value — but they leaked: when a dog cycle closed the root, the child
+	// step wisps were orphaned as status=open and accumulated in the hq DB
+	// (711/873 open wisps were daemon dog steps; gt-ldw). Root-only eliminates
+	// the leak at the source, matching the patrol-molecule design
+	// (autoSpawnPatrol) where steps are read inline, not tracked as DB rows.
+	args := []string{"mol", "wisp", formulaName, "--root-only"}
 	for k, v := range vars {
 		args = append(args, "--var", fmt.Sprintf("%s=%s", k, v))
 	}
@@ -60,10 +71,11 @@ func (d *Daemon) pourDogMolecule(formulaName string, vars map[string]string) *do
 		return dm
 	}
 
-	// Discover step IDs by listing children of the root wisp.
+	// Discover step IDs by listing children of the root wisp. For root-only
+	// molecules there are no child steps, so this is a no-op.
 	dm.discoverSteps()
 
-	d.logger.Printf("dog_molecule: poured %s → %s (%d steps)", formulaName, dm.rootID, len(dm.stepIDs))
+	d.logger.Printf("dog_molecule: poured %s → %s (root-only)", formulaName, dm.rootID)
 	return dm
 }
 
@@ -71,6 +83,9 @@ func (d *Daemon) pourDogMolecule(formulaName string, vars map[string]string) *do
 func (dm *dogMol) closeStep(stepSlug string) {
 	if dm.rootID == "" {
 		return // No molecule — graceful degradation.
+	}
+	if dm.rootOnly {
+		return // Root-only molecule has no materialized step wisps to close.
 	}
 
 	stepID, ok := dm.stepIDs[stepSlug]
@@ -90,6 +105,9 @@ func (dm *dogMol) closeStep(stepSlug string) {
 func (dm *dogMol) failStep(stepSlug, reason string) {
 	if dm.rootID == "" {
 		return
+	}
+	if dm.rootOnly {
+		return // Root-only molecule has no materialized step wisps to fail.
 	}
 
 	stepID, ok := dm.stepIDs[stepSlug]
@@ -166,6 +184,9 @@ func (dm *dogMol) closeRemainingSteps() {
 func (dm *dogMol) discoverSteps() {
 	if dm.rootID == "" {
 		return
+	}
+	if dm.rootOnly {
+		return // Root-only molecule has no child step wisps to discover.
 	}
 
 	// Use bd show to get children. The mol wisp command creates child wisps
