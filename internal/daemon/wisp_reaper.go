@@ -26,6 +26,12 @@ const (
 	defaultMailDeleteAge = 7 * 24 * time.Hour
 	// Issues stale longer than this are auto-closed. Formula var: stale_issue_age.
 	defaultStaleIssueAge = 7 * 24 * time.Hour
+	// Plugin run receipts and dispatch mails are closed on a fast track (1h)
+	// rather than waiting for the 7-day AutoClose. They are transient
+	// daemon/dog bookkeeping beads that exist only for cooldown-gate/audit
+	// queries (which include closed beads); leaving them open accumulates hq
+	// bloat. See gt-b2s.
+	pluginBeadFastTrackAge = 1 * time.Hour
 )
 
 // WispReaperConfig holds configuration for the wisp_reaper patrol.
@@ -111,14 +117,27 @@ func (d *Daemon) reapWisps() {
 		d.logger.Printf("wisp_reaper: DRY RUN — reporting only, no changes will be made")
 	}
 
-	// Try dispatching to a Dog for formula-driven execution.
-	if err := d.dispatchReaperDog(vars); err != nil {
-		d.logger.Printf("wisp_reaper: Dog dispatch failed (%v), running inline fallback", err)
-		d.reapWispsInline(config, maxAge, deleteAge, mol)
-		return
+	// Resolve the database list once — needed both by the inline fallback and
+	// by the unconditional plugin-bead close below.
+	databases := config.Databases
+	if len(databases) == 0 {
+		databases = reaper.DiscoverDatabases("127.0.0.1", d.doltServerPort())
 	}
 
-	d.logger.Printf("wisp_reaper: dispatched to Dog for formula-driven execution")
+	// Heavy wisp reaping: prefer Dog dispatch (formula-driven), fall back to
+	// inline execution if the Dog can't be dispatched.
+	if err := d.dispatchReaperDog(vars); err != nil {
+		d.logger.Printf("wisp_reaper: Dog dispatch failed (%v), running inline fallback", err)
+		d.reapWispsInline(config, maxAge, deleteAge, databases, mol)
+	} else {
+		d.logger.Printf("wisp_reaper: dispatched to Dog for formula-driven execution")
+	}
+
+	// Always fast-track close plugin run receipts + dispatch mails (gt-b2s).
+	// The Dog-driven mol-dog-reaper formula never closes these, and reaper.Reap
+	// can't (they live in the issues table, not wisps), so the daemon must own
+	// this every cycle — independent of whether reaping ran via Dog or inline.
+	d.closePluginBeads(databases, config.DryRun)
 }
 
 // dispatchReaperDog dispatches the mol-dog-reaper formula to a Dog via gt sling.
@@ -144,11 +163,9 @@ func (d *Daemon) dispatchReaperDog(vars map[string]string) error {
 
 // reapWispsInline is the fallback that runs the reaper cycle inline when
 // Dog dispatch is unavailable. Delegates to the reaper package for SQL execution.
-func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge time.Duration, mol *dogMol) {
-	databases := config.Databases
-	if len(databases) == 0 {
-		databases = reaper.DiscoverDatabases("127.0.0.1", d.doltServerPort())
-	}
+// Plugin run receipts + dispatch mails are NOT closed here — reapWisps closes
+// them unconditionally after the dispatch decision (gt-b2s).
+func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge time.Duration, databases []string, mol *dogMol) {
 	if len(databases) == 0 {
 		d.logger.Printf("wisp_reaper: no databases to reap")
 		mol.failStep("scan", "no databases found")
@@ -231,59 +248,8 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		mol.closeStep("purge")
 	}
 
-	// Step 3b: Close plugin receipts (fast-track — 1h instead of 7d stale age)
-	pluginReceiptAge := 1 * time.Hour
-	var totalPluginClosed int
-	for _, dbName := range databases {
-		if err := reaper.ValidateDBName(dbName); err != nil {
-			continue
-		}
-		db, err := reaper.OpenDB("127.0.0.1", port, dbName, 10*time.Second, 10*time.Second)
-		if err != nil {
-			continue
-		}
-		if ok, _ := reaper.HasReaperSchema(db); !ok {
-			db.Close()
-			continue
-		}
-		result, err := reaper.ClosePluginReceipts(db, dbName, pluginReceiptAge, dryRun)
-		db.Close()
-		if err != nil {
-			d.logger.Printf("wisp_reaper: %s: plugin receipt close error: %v", dbName, err)
-			continue
-		}
-		totalPluginClosed += result.Closed
-		if result.Closed > 0 {
-			d.logger.Printf("wisp_reaper: %s: closed %d plugin receipts", dbName, result.Closed)
-		}
-	}
-
-	// Step 3c: Close plugin dispatch mails (daemon→dog instruction beads that are never closed)
-	pluginDispatchAge := 1 * time.Hour
-	var totalDispatchClosed int
-	for _, dbName := range databases {
-		if err := reaper.ValidateDBName(dbName); err != nil {
-			continue
-		}
-		db, err := reaper.OpenDB("127.0.0.1", port, dbName, 10*time.Second, 10*time.Second)
-		if err != nil {
-			continue
-		}
-		if ok, _ := reaper.HasReaperSchema(db); !ok {
-			db.Close()
-			continue
-		}
-		result, err := reaper.ClosePluginDispatches(db, dbName, pluginDispatchAge, dryRun)
-		db.Close()
-		if err != nil {
-			d.logger.Printf("wisp_reaper: %s: plugin dispatch close error: %v", dbName, err)
-			continue
-		}
-		totalDispatchClosed += result.Closed
-		if result.Closed > 0 {
-			d.logger.Printf("wisp_reaper: %s: closed %d plugin dispatches", dbName, result.Closed)
-		}
-	}
+	// Plugin run receipts + dispatch mails are closed by reapWisps (gt-b2s),
+	// not here, so they get fast-track-closed on both the Dog and inline paths.
 
 	// Step 4: Auto-close
 	autoCloseErrors := 0
@@ -322,9 +288,67 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		d.logger.Printf("wisp_reaper: WARNING: %d open wisps exceed threshold %d — investigate wisp lifecycle",
 			totalOpen, wispAlertThreshold)
 	}
-	d.logger.Printf("wisp_reaper: cycle complete — reaped=%d purged=%d mail_purged=%d plugin_closed=%d dispatch_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
-		totalReaped, totalPurged, totalMailPurged, totalPluginClosed, totalDispatchClosed, totalAutoClosed, totalOpen, len(databases), dryRun)
+	d.logger.Printf("wisp_reaper: inline cycle complete — reaped=%d purged=%d mail_purged=%d auto_closed=%d open=%d databases=%d dryRun=%v",
+		totalReaped, totalPurged, totalMailPurged, totalAutoClosed, totalOpen, len(databases), dryRun)
 	mol.closeStep("report")
+}
+
+// closePluginBeads fast-track closes plugin run receipts (type:plugin-run, e.g.
+// dog RESULT chore wisps like "compactor-dog: ...") and plugin dispatch mails
+// (from:daemon, title "Plugin:...") across the given databases.
+//
+// This MUST run every reaper cycle regardless of whether the heavy wisp reaping
+// was delegated to a Dog or run inline: the Dog-driven mol-dog-reaper formula
+// (scan/reap/purge/auto-close) never closes these beads, and reaper.Reap can't
+// (it operates on the wisps table while these live in the issues table). Before
+// gt-b2s the closers ran only in reapWispsInline (the dog-dispatch-failure
+// fallback), so in normal operation they never ran and the beads accumulated
+// until the 7-day AutoClose — the recurring source of hq bloat. Dog sessions
+// die unreliably, so the daemon owns this close itself.
+func (d *Daemon) closePluginBeads(databases []string, dryRun bool) (receiptsClosed, dispatchesClosed int) {
+	closeFn := d.closePluginBeadsInDB
+	if closeFn == nil {
+		closeFn = d.defaultClosePluginBeadsInDB
+	}
+	port := d.doltServerPort()
+	for _, dbName := range databases {
+		receipts, dispatches, err := closeFn(port, dbName, pluginBeadFastTrackAge, dryRun)
+		if err != nil {
+			d.logger.Printf("wisp_reaper: %s: plugin bead close error: %v", dbName, err)
+			continue
+		}
+		receiptsClosed += receipts
+		dispatchesClosed += dispatches
+		if receipts > 0 || dispatches > 0 {
+			d.logger.Printf("wisp_reaper: %s: closed %d plugin receipts, %d plugin dispatches", dbName, receipts, dispatches)
+		}
+	}
+	return receiptsClosed, dispatchesClosed
+}
+
+// defaultClosePluginBeadsInDB is the live implementation backing closePluginBeads:
+// it opens dbName and delegates to reaper.ClosePluginReceipts + ClosePluginDispatches.
+func (d *Daemon) defaultClosePluginBeadsInDB(port int, dbName string, age time.Duration, dryRun bool) (int, int, error) {
+	if err := reaper.ValidateDBName(dbName); err != nil {
+		return 0, 0, err
+	}
+	db, err := reaper.OpenDB("127.0.0.1", port, dbName, 10*time.Second, 10*time.Second)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer db.Close()
+	if ok, _ := reaper.HasReaperSchema(db); !ok {
+		return 0, 0, nil
+	}
+	receipts, err := reaper.ClosePluginReceipts(db, dbName, age, dryRun)
+	if err != nil {
+		return 0, 0, err
+	}
+	dispatches, err := reaper.ClosePluginDispatches(db, dbName, age, dryRun)
+	if err != nil {
+		return receipts.Closed, 0, err
+	}
+	return receipts.Closed, dispatches.Closed, nil
 }
 
 // doltServerPort returns the configured Dolt server port.
