@@ -87,6 +87,13 @@ type Daemon struct {
 	gtPath string
 	bdPath string
 
+	// closePluginBeadsInDB closes plugin run receipts (type:plugin-run) and
+	// plugin dispatch mails (from:daemon, title "Plugin:...") older than age in
+	// one database, returning (receiptsClosed, dispatchesClosed). It is a field
+	// so tests can substitute a fake without a live Dolt server; nil means use
+	// the live reaper implementation (defaultClosePluginBeadsInDB). See gt-b2s.
+	closePluginBeadsInDB func(port int, dbName string, age time.Duration, dryRun bool) (int, int, error)
+
 	// Boot spawn cooldown: prevents Boot from spawning on every heartbeat tick.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	bootLastSpawned time.Time
