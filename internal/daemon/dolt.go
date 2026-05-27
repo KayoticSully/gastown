@@ -155,6 +155,13 @@ type DoltServerManager struct {
 	readOnlyAlertFn   func(error)
 	crashAlertFn      func(int)
 	listDatabasesFn   func() ([]string, error)
+
+	// Imposter-eviction hooks (nil = use real doltserver implementations).
+	// checkPortConflictFn reports a foreign dolt server squatting the port as
+	// (pid, dataDir); killImpostersFn evicts it. Set only in tests so unit tests
+	// never shell out to lsof or risk killing the real production server.
+	checkPortConflictFn func() (int, string)
+	killImpostersFn     func() error
 }
 
 // NewDoltServerManager creates a new Dolt server manager.
@@ -880,6 +887,69 @@ behavior:
 	return os.WriteFile(configPath, []byte(content), 0600)
 }
 
+// doltImposterPortReleaseTimeout is how long startLocked waits for the port to
+// be released after evicting an imposter before launching the new server.
+const doltImposterPortReleaseTimeout = 5 * time.Second
+
+// checkPortConflict reports a foreign dolt server squatting the managed port as
+// (pid, dataDir), or (0, "") when the port is free or held by this town's own
+// server. Uses the injected hook in tests; in production it delegates to
+// doltserver.CheckPortConflict, which inspects the canonical port (3307) — so
+// the real path only applies when this manager is bound to that port.
+func (m *DoltServerManager) checkPortConflict() (int, string) {
+	if m.checkPortConflictFn != nil {
+		return m.checkPortConflictFn()
+	}
+	if m.config.Port != doltserver.DefaultPort {
+		return 0, ""
+	}
+	return doltserver.CheckPortConflict(m.townRoot)
+}
+
+// killImposters evicts a foreign dolt server squatting the managed port. Uses
+// the injected hook in tests; in production it delegates to
+// doltserver.KillImposters (a no-op when the port holder is the legitimate
+// server).
+func (m *DoltServerManager) killImposters() error {
+	if m.killImpostersFn != nil {
+		return m.killImpostersFn()
+	}
+	return doltserver.KillImposters(m.townRoot)
+}
+
+// waitForPortFree blocks until the managed port stops accepting connections or
+// the timeout elapses, so a freshly launched server can bind it.
+func (m *DoltServerManager) waitForPortFree(timeout time.Duration) {
+	deadline := m.now().Add(timeout)
+	for m.now().Before(deadline) {
+		if !m.isDoltServerOnPort() {
+			return
+		}
+		m.doSleep(100 * time.Millisecond)
+	}
+}
+
+// evictPortImpostersLocked kills any rogue dolt server squatting the managed
+// port before we (re)launch. When the real server dies, bd's embedded fallback
+// can spawn a rogue dolt from a rig's .beads/dolt that binds :3307 serving only
+// an empty 'dolt' db; without evicting it our new server cannot bind the port
+// and the daemon crash-loops with no auto-recovery (gt-ac8). The imposter-kill
+// otherwise lived only in the periodic identity check, which is unreachable
+// once the server is dead. Safe to always call: it is a no-op when the port is
+// free or held by this town's own legitimate server. Must hold m.mu.
+func (m *DoltServerManager) evictPortImpostersLocked() {
+	conflictPID, conflictDir := m.checkPortConflict()
+	if conflictPID <= 0 {
+		return
+	}
+	m.logger("Dolt port %d held by imposter (PID %d, data-dir %q) — killing before (re)start",
+		m.config.Port, conflictPID, conflictDir)
+	if err := m.killImposters(); err != nil {
+		m.logger("Warning: failed to kill imposter on port %d: %v", m.config.Port, err)
+	}
+	m.waitForPortFree(doltImposterPortReleaseTimeout)
+}
+
 // Start starts the Dolt SQL server.
 func (m *DoltServerManager) Start() error {
 	m.mu.Lock()
@@ -889,16 +959,21 @@ func (m *DoltServerManager) Start() error {
 
 // startLocked starts the Dolt server. Must be called with m.mu held.
 func (m *DoltServerManager) startLocked() error {
-	if m.startFn != nil {
-		return m.startFn()
-	}
-
 	// Re-check if the server is already running to close the TOCTOU window.
 	// Another goroutine may have started the server while we were waiting
 	// for the mutex (via Start()) or during backoff sleep (via restartWithBackoff()).
 	if _, running := m.isRunning(); running {
 		m.logger("Dolt server already running, skipping start")
 		return nil
+	}
+
+	// Evict any imposter squatting the port before launching. Without this the
+	// new server cannot bind the port and the daemon crash-loops with no
+	// auto-recovery (gt-ac8). No-op when the port is free or ours.
+	m.evictPortImpostersLocked()
+
+	if m.startFn != nil {
+		return m.startFn()
 	}
 
 	// Ensure data directory exists
