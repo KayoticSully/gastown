@@ -5,7 +5,7 @@ package daemon
 //
 // All patrols are enabled with conservative intervals:
 //   - Wisp Reaper (DECAY): every 30m, delete closed wisps after 7d
-//   - Compactor Dog (COMPACT): every 24h, threshold 2000 commits
+//   - Compactor Dog (COMPACT): every 6h, threshold 2000 commits
 //   - Checkpoint Dog: every 10m, auto-commit dirty polecat worktrees
 //   - Doctor Dog (health): every 5m
 //   - JSONL Git Backup: every 15m
@@ -27,7 +27,7 @@ func DefaultLifecycleConfig() *DaemonPatrolConfig {
 			},
 			CompactorDog: &CompactorDogConfig{
 				Enabled:     true,
-				IntervalStr: "24h",
+				IntervalStr: "6h",
 				Threshold:   defaultCompactorCommitThreshold,
 			},
 			CheckpointDog: &CheckpointDogConfig{

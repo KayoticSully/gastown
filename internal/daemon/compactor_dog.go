@@ -23,7 +23,14 @@ func shortHash(hash string) string {
 }
 
 const (
-	defaultCompactorDogInterval = 24 * time.Hour
+	// defaultCompactorDogInterval is how often the compactor checks each
+	// production database's commit count. At ~78 commits/hr (observed on hq),
+	// a 24h cadence let history bloat reach ~3.7k commits between compactions,
+	// which drove Dolt chunk-store + commit-graph memory growth toward OOM.
+	// 6h checks 4x/day, bounding bloat to ~2.5k commits and making compaction+gc
+	// fire reliably each day. The 2000-commit threshold (not the cadence) is the
+	// feedback-loop guard, so tightening the cadence is safe. (gt-enz)
+	defaultCompactorDogInterval = 6 * time.Hour
 	// defaultCompactorCommitThreshold is the minimum commit count before compaction triggers.
 	// 2000 commits prevents the escalation feedback loop where each compaction
 	// failure creates beads/escalations that add more commits than the compactor
@@ -64,7 +71,7 @@ type CompactorDogConfig struct {
 	KeepRecent int `json:"keep_recent,omitempty"`
 }
 
-// compactorDogInterval returns the configured interval, or the default (24h).
+// compactorDogInterval returns the configured interval, or the default (6h).
 func compactorDogInterval(config *DaemonPatrolConfig) time.Duration {
 	if config != nil && config.Patrols != nil && config.Patrols.CompactorDog != nil {
 		if config.Patrols.CompactorDog.IntervalStr != "" {
@@ -76,7 +83,7 @@ func compactorDogInterval(config *DaemonPatrolConfig) time.Duration {
 	return defaultCompactorDogInterval
 }
 
-// compactorDogThreshold returns the configured commit threshold, or the default (500).
+// compactorDogThreshold returns the configured commit threshold, or the default (2000).
 func compactorDogThreshold(config *DaemonPatrolConfig) int {
 	if config != nil && config.Patrols != nil && config.Patrols.CompactorDog != nil {
 		if config.Patrols.CompactorDog.Threshold > 0 {
