@@ -25,6 +25,14 @@ const doltCmdTimeout = 15 * time.Second
 // within 30s instead of up to 3 minutes.
 const DefaultDoltHealthCheckInterval = 30 * time.Second
 
+// defaultDoltMemoryCeilingMB is the resident-set-size ceiling (in MB) above
+// which the daemon proactively recycles the Dolt server. RSS was observed
+// climbing to ~1.9GB before macOS silently SIGKILLed the process (no
+// crash/panic/OOM line in dolt.log), which then triggered the imposter race
+// and a town-wide outage. 1.5GB leaves headroom to perform a *graceful*
+// restart (flushing the journal) well before the danger zone. (gt-enz)
+const defaultDoltMemoryCeilingMB = 1536
+
 // DoltServerConfig holds configuration for the Dolt SQL server.
 type DoltServerConfig struct {
 	// Enabled controls whether the daemon manages a Dolt server.
@@ -77,6 +85,14 @@ type DoltServerConfig struct {
 	// detection of Dolt server crashes without changing the overall
 	// heartbeat frequency. Default 30s.
 	HealthCheckInterval time.Duration `json:"health_check_interval,omitempty"`
+
+	// MemoryCeilingMB is the RSS ceiling (in MB) above which the daemon
+	// proactively recycles the Dolt server with a graceful restart, before
+	// the OS OOM-kills it. Semantics:
+	//   0 (unset) → use defaultDoltMemoryCeilingMB (on by default)
+	//   negative  → disabled (explicit opt-out)
+	//   positive  → use that value
+	MemoryCeilingMB int `json:"memory_ceiling_mb,omitempty"`
 }
 
 // DefaultDoltServerConfig returns sensible defaults for Dolt server config.
@@ -95,6 +111,7 @@ func DefaultDoltServerConfig(townRoot string) *DoltServerConfig {
 		RestartWindow:        10 * time.Minute,
 		HealthyResetInterval: 5 * time.Minute,
 		HealthCheckInterval:  DefaultDoltHealthCheckInterval,
+		MemoryCeilingMB:      defaultDoltMemoryCeilingMB,
 	}
 }
 
@@ -154,6 +171,8 @@ type DoltServerManager struct {
 	unhealthyAlertFn  func(error)
 	readOnlyAlertFn   func(error)
 	crashAlertFn      func(int)
+	memoryAlertFn     func(rss, ceiling int64)
+	rssCheckFn        func(pid int) int64 // nil = use real processRSSBytes
 	listDatabasesFn   func() ([]string, error)
 
 	// Imposter-eviction hooks (nil = use real doltserver implementations).
@@ -319,6 +338,54 @@ func (m *DoltServerManager) HealthCheckInterval() time.Duration {
 	return DefaultDoltHealthCheckInterval
 }
 
+// memoryCeilingBytes returns the configured RSS ceiling in bytes, or 0 if the
+// memory watchdog is disabled. See DoltServerConfig.MemoryCeilingMB for the
+// 0/negative/positive semantics.
+func (m *DoltServerManager) memoryCeilingBytes() int64 {
+	if m.config == nil {
+		return 0
+	}
+	mb := m.config.MemoryCeilingMB
+	switch {
+	case mb < 0:
+		return 0 // explicitly disabled
+	case mb == 0:
+		mb = defaultDoltMemoryCeilingMB // unset → default
+	}
+	return int64(mb) * 1024 * 1024
+}
+
+// processRSS returns the resident set size of the given PID in bytes.
+// Uses the test hook if set, otherwise the real implementation.
+func (m *DoltServerManager) processRSS(pid int) int64 {
+	if m.rssCheckFn != nil {
+		return m.rssCheckFn(pid)
+	}
+	return processRSSBytes(pid)
+}
+
+// processRSSBytes returns the resident set size of the given PID in bytes,
+// or 0 if it can't be determined. Uses `ps -o rss=`, which reports the RSS
+// in KB on both macOS and Linux.
+func processRSSBytes(pid int) int64 {
+	if pid <= 0 {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ps", "-o", "rss=", "-p", strconv.Itoa(pid))
+	setSysProcAttr(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	kb, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil || kb < 0 {
+		return 0
+	}
+	return kb * 1024
+}
+
 // Status returns the current status of the Dolt server.
 func (m *DoltServerManager) Status() *DoltServerStatus {
 	m.mu.Lock()
@@ -474,6 +541,26 @@ func (m *DoltServerManager) EnsureRunning() error {
 					m.logger("Warning: failed to kill imposters: %v", killErr)
 				}
 				time.Sleep(500 * time.Millisecond)
+				return m.restartWithBackoff()
+			}
+		}
+
+		// Memory ceiling: proactively recycle before the OS OOM-kills the server.
+		// macOS sends an unloggable SIGKILL when RSS grows too large; a graceful
+		// restart here flushes the journal and avoids the silent-death + imposter
+		// race that follows an OOM kill (gt-enz). Memory grows over hours, so this
+		// won't trip the restart cap (which counts restarts within RestartWindow).
+		if ceiling := m.memoryCeilingBytes(); ceiling > 0 {
+			if rss := m.processRSS(pid); rss >= ceiling {
+				m.logger("Dolt server RSS %s exceeds ceiling %s, recycling proactively...",
+					formatDiskSize(rss), formatDiskSize(ceiling))
+				detail := fmt.Sprintf("RSS %s >= ceiling %s", formatDiskSize(rss), formatDiskSize(ceiling))
+				if m.writeUnhealthySignal("memory_ceiling", detail) {
+					m.sendMemoryCeilingAlert(rss, ceiling)
+				} else {
+					m.logger("Dolt incident already active; suppressing duplicate memory-ceiling alert")
+				}
+				m.stopLocked()
 				return m.restartWithBackoff()
 			}
 		}
@@ -722,6 +809,40 @@ Host: %s:%d
 
 This may indicate high load, connection exhaustion, or internal server errors.`,
 		healthErr,
+		m.config.DataDir, m.config.LogFile,
+		m.config.Host, m.config.Port)
+
+	townRoot := m.townRoot
+	logger := m.logger
+
+	go func() {
+		sendDoltAlertMail(townRoot, "mayor/", subject, body, logger)
+		sendDoltAlertToWitnesses(townRoot, subject, body, logger)
+	}()
+}
+
+// sendMemoryCeilingAlert sends a mail to the mayor when the Dolt server's RSS
+// exceeds the configured ceiling and the daemon proactively recycles it. This
+// is distinct from a crash — the server was healthy but growing, so we restart
+// it gracefully before the OS OOM-kills it. Runs asynchronously.
+func (m *DoltServerManager) sendMemoryCeilingAlert(rss, ceiling int64) {
+	if m.memoryAlertFn != nil {
+		m.memoryAlertFn(rss, ceiling)
+		return
+	}
+	subject := "ALERT: Dolt server hit memory ceiling — proactive restart"
+	body := fmt.Sprintf(`The Dolt server RSS reached %s, at or above the configured ceiling of %s.
+The daemon is recycling it with a graceful restart to avoid a silent OS OOM kill
+(which previously caused the imposter race and town-wide outages).
+
+Data dir: %s
+Log file: %s
+Host: %s:%d
+
+If this recurs frequently, investigate the memory-growth driver (heavy queries,
+commit-history bloat, or connection pileup) and consider tightening the compactor
+cadence or reducing concurrent write load.`,
+		formatDiskSize(rss), formatDiskSize(ceiling),
 		m.config.DataDir, m.config.LogFile,
 		m.config.Host, m.config.Port)
 
