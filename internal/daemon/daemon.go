@@ -141,6 +141,14 @@ type Daemon struct {
 	// legacySocketCleanupOnce ensures upgrade cleanup only runs once per daemon
 	// lifetime, before any patrol agent can be started on the current socket.
 	legacySocketCleanupOnce sync.Once
+
+	// wispConfigWarned tracks rigs we have already warned about for a missing wisp
+	// config (keyed by rig name). A missing config is the normal default for a rig
+	// that was never parked/docked, and isRigOperational runs every patrol tick, so
+	// without dedup the warning floods the daemon log every ~5s. We log it once per
+	// rig per daemon lifetime instead. Concurrency-safe (isRigOperational runs from
+	// multiple goroutines).
+	wispConfigWarned sync.Map
 }
 
 // sessionDeath records a detected session death for mass death analysis.
@@ -2158,9 +2166,13 @@ func (d *Daemon) getPatrolRigs(patrol string) []string {
 func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 	cfg := wisp.NewConfig(d.config.TownRoot, rigName)
 
-	// Warn if wisp config is missing - parked/docked state may have been lost
+	// A missing wisp config is the expected default for a rig that was never
+	// parked/docked. Warn at most once per rig (this runs every patrol tick) so a
+	// benign absence does not flood the log every ~5s.
 	if _, err := os.Stat(cfg.ConfigPath()); os.IsNotExist(err) {
-		d.logger.Printf("Warning: no wisp config for %s - parked state may have been lost", rigName)
+		if _, warned := d.wispConfigWarned.LoadOrStore(rigName, struct{}{}); !warned {
+			d.logger.Printf("Warning: no wisp config for %s - parked state may have been lost", rigName)
+		}
 	}
 
 	// Check wisp layer first (local/ephemeral overrides)
