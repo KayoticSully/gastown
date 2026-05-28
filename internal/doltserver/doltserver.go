@@ -3661,7 +3661,8 @@ type HealthMetrics struct {
 	// DiskUsageHuman is a human-readable disk usage string.
 	DiskUsageHuman string `json:"disk_usage_human"`
 
-	// QueryLatency is the time taken for a SELECT active_branch() round-trip.
+	// QueryLatency is the time taken for a real table-scan round-trip (a bounded
+	// dolt_log scan), reflecting actual query-execution latency, not just handshake.
 	// Note: json.Marshal emits nanoseconds for time.Duration. Consumers should use
 	// ServerHealth.LatencyMs (int64 milliseconds) for JSON output instead.
 	QueryLatency time.Duration `json:"query_latency_ns"`
@@ -3698,7 +3699,7 @@ func GetHealthMetrics(townRoot string) *HealthMetrics {
 		metrics.MaxConnections = 1000 // Dolt default
 	}
 
-	// 1. Query latency: time a SELECT active_branch()
+	// 1. Query latency: time a real table scan (bounded dolt_log read)
 	latency, err := MeasureQueryLatency(townRoot)
 	if err == nil {
 		metrics.QueryLatency = latency
@@ -3887,9 +3888,17 @@ func doltSQLWithRecovery(townRoot, rigDB, query string) error {
 	return nil
 }
 
-// MeasureQueryLatency times a SELECT active_branch() query against the Dolt server.
-// Per Tim Sehn (Dolt CEO): active_branch() is a lightweight probe that won't block
-// behind queued queries, unlike SELECT 1 which goes through the full query executor.
+// MeasureQueryLatency times a real table-scan query against the Dolt server so the
+// result reflects actual query-execution latency — including the query executor and
+// storage/chunk-store reads — not just connection/handshake time.
+//
+// History: this probe previously ran SELECT active_branch(), a session-local function
+// that never touches storage. During the 2026-05-26 incident it reported ~0s/healthy
+// while real bd queries took ~10s, masking the degradation for ~18h of confused
+// "healthy but timing out" escalations (hq-wisp-lg0tg). We now scan dolt_log — a real
+// table backed by the commit graph, present in every Dolt database — so storage and
+// memory pressure show up in the measured latency.
+//
 // Uses a direct TCP connection via the Go MySQL driver to measure actual query
 // latency, not subprocess startup time.
 func MeasureQueryLatency(townRoot string) (time.Duration, error) {
@@ -3908,16 +3917,38 @@ func MeasureQueryLatency(townRoot string) (time.Duration, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	start := time.Now()
-	var branch string
-	err = db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&branch)
-	elapsed := time.Since(start)
-
-	if err != nil {
-		return 0, fmt.Errorf("SELECT active_branch() failed: %w", err)
+	// Probe a real table so the measurement exercises the query executor and storage
+	// layer. Scanning a bounded slice of dolt_log (the most recent commits) is small
+	// and fast on a healthy server but surfaces real latency under storage/memory
+	// pressure — unlike active_branch(), which is resolved in-session and stays ~0s.
+	if databases, dbErr := ListDatabases(townRoot); dbErr == nil && len(databases) > 0 {
+		query := fmt.Sprintf("SELECT message FROM `%s`.dolt_log LIMIT 100", databases[0])
+		start := time.Now()
+		rows, scanErr := db.QueryContext(ctx, query)
+		if scanErr == nil {
+			for rows.Next() {
+				var msg sql.NullString
+				if err := rows.Scan(&msg); err != nil {
+					break
+				}
+			}
+			rowsErr := rows.Err()
+			rows.Close()
+			if rowsErr == nil {
+				return time.Since(start), nil
+			}
+		}
+		// Fall through to the connection-level probe if the table scan fails (e.g.
+		// the database was dropped mid-query or lacks a readable dolt_log).
 	}
 
-	return elapsed, nil
+	// Fallback: connection-level probe when no scannable database is available.
+	start := time.Now()
+	var branch string
+	if err := db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&branch); err != nil {
+		return 0, fmt.Errorf("query latency probe failed: %w", err)
+	}
+	return time.Since(start), nil
 }
 
 // GetLastCommitAge returns the age and database name of the most recent Dolt commit
