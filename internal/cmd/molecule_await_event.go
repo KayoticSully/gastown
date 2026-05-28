@@ -83,19 +83,23 @@ EXIT CODES:
   0 - Event(s) found, timeout, or context-yield
   1 - Error
 
+NOTE: The Deacon uses "gt mol step await-signal --agent-bead <your-agent-bead>",
+not await-event. Substitute your own channel/agent-bead below — these are
+placeholders, not literal values to copy verbatim.
+
 EXAMPLES:
-  # Wait for refinery events with 10min timeout
-  gt mol step await-event --channel refinery --timeout 10m
+  # Wait for events on a channel with 10min timeout
+  gt mol step await-event --channel <channel> --timeout 10m
 
   # Backoff mode with agent bead tracking
-  gt mol step await-event --channel refinery --agent-bead VAS-refinery \
+  gt mol step await-event --channel <channel> --agent-bead <your-agent-bead> \
     --backoff-base 60s --backoff-mult 2 --backoff-max 10m
 
   # Auto-cleanup processed events
-  gt mol step await-event --channel refinery --cleanup
+  gt mol step await-event --channel <channel> --cleanup
 
   # Yield every 5m for context check during long idle waits
-  gt mol step await-event --channel refinery --agent-bead VAS-refinery \
+  gt mol step await-event --channel <channel> --agent-bead <your-agent-bead> \
     --backoff-base 60s --backoff-mult 2 --backoff-max 15m --cleanup \
     --context-check-interval 5m`,
 	RunE: runMoleculeAwaitEvent,
@@ -118,7 +122,7 @@ type EventFile struct {
 
 func init() {
 	moleculeAwaitEventCmd.Flags().StringVar(&awaitEventChannel, "channel", "",
-		"Event channel name (required, e.g., 'refinery')")
+		"Event channel name (required, e.g., '<channel>')")
 	moleculeAwaitEventCmd.Flags().StringVar(&awaitEventRig, "rig", "",
 		"Rig that scopes the channel (default: GT_RIG env or detected from cwd). "+
 			"Watches ~/gt/events/<rig>/<channel>/ so other rigs' events are never consumed.")
