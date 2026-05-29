@@ -95,6 +95,14 @@ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 		return fmt.Errorf("creating nudge queue dir: %w", err)
 	}
 
+	// Evict expired entries before the depth check so dead messages never
+	// block live ones. Without this, a queue that fills with short-TTL nudges
+	// and is never drained (e.g. the recipient's poller died) pins itself at
+	// the cap with stale entries and silently rejects ALL new inbound nudges.
+	// Drain discards expired entries too, but Drain only runs when the
+	// recipient is actively polling — eviction on enqueue closes that gap. (hq-73ua)
+	_, _ = EvictExpired(townRoot, session)
+
 	// Check queue depth before writing to prevent runaway senders.
 	maxDepth := nudgeConfig(townRoot).MaxQueueDepthV()
 	pending, _ := Pending(townRoot, session)
@@ -150,6 +158,62 @@ func Requeue(townRoot, session string, nudges []QueuedNudge) error {
 		}
 	}
 	return nil
+}
+
+// EvictExpired removes queued nudges whose ExpiresAt is in the past, returning
+// the number evicted. It only inspects .json files (never in-flight .claimed
+// files), so it is safe to run concurrently with Drain.
+//
+// This keeps the queue-depth cap meaningful: expired entries are not live
+// messages and must not consume cap slots. Enqueue calls this before its depth
+// check so a queue full of stale nudges can never silently drop new inbound
+// ones. (hq-73ua)
+func EvictExpired(townRoot, session string) (int, error) {
+	dir := queueDir(townRoot, session)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("reading nudge queue: %w", err)
+	}
+
+	now := time.Now()
+	evicted := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			// Vanished (claimed by a racing Drain) or transient read error —
+			// leave it for Drain to handle rather than risk dropping a live nudge.
+			continue
+		}
+
+		var n QueuedNudge
+		if err := json.Unmarshal(data, &n); err != nil {
+			// Malformed — leave it for Drain, which cleans these up.
+			continue
+		}
+
+		// Only evict entries with a real expiry that has lapsed. A zero
+		// ExpiresAt means "never expires" and must be preserved.
+		if n.ExpiresAt.IsZero() || !now.After(n.ExpiresAt) {
+			continue
+		}
+
+		if err := os.Remove(path); err == nil {
+			evicted++
+		}
+		// A failed remove (ENOENT from a racing claim, etc.) is benign — the
+		// file is either already gone or will be handled by Drain.
+	}
+
+	return evicted, nil
 }
 
 // Drain reads and removes all queued nudges for a session, returning them
