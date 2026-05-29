@@ -33,13 +33,23 @@ func TestDoctorDogInterval(t *testing.T) {
 }
 
 func TestDoctorDogDatabases(t *testing.T) {
-	// Default databases
-	dbs := doctorDogDatabases(nil)
-	if len(dbs) != 3 {
-		t.Errorf("expected 3 default databases, got %d", len(dbs))
+	// Default databases: derived from the rig registry. With an empty town root
+	// (no registry/metadata), this falls back to the always-present town
+	// databases {"gt", "hq"} — and must never include the bogus "mo" (hq-pwfqv).
+	dbs := doctorDogDatabases(nil, t.TempDir())
+	if len(dbs) == 0 {
+		t.Fatal("expected non-empty default database list")
+	}
+	for _, db := range dbs {
+		if db == "mo" {
+			t.Errorf("default database list must never contain 'mo', got %v", dbs)
+		}
+	}
+	if !containsString(dbs, "hq") || !containsString(dbs, "gt") {
+		t.Errorf("default database list should contain hq and gt, got %v", dbs)
 	}
 
-	// Custom databases
+	// Custom databases: explicit config override always wins, verbatim.
 	config := &DaemonPatrolConfig{
 		Patrols: &PatrolsConfig{
 			DoctorDog: &DoctorDogConfig{
@@ -48,10 +58,19 @@ func TestDoctorDogDatabases(t *testing.T) {
 			},
 		},
 	}
-	dbs = doctorDogDatabases(config)
+	dbs = doctorDogDatabases(config, t.TempDir())
 	if len(dbs) != 2 {
 		t.Errorf("expected 2 custom databases, got %d", len(dbs))
 	}
+}
+
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
 }
 
 func TestIsPatrolEnabled_DoctorDog(t *testing.T) {

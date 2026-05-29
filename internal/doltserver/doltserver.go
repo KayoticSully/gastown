@@ -39,6 +39,7 @@ import (
 	"path/filepath"
 
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -3073,14 +3074,20 @@ func readExistingDoltDatabase(beadsDir string) string {
 	return ""
 }
 
-// collectReferencedDatabases returns a set of database names referenced by
-// any rig's metadata.json dolt_database field. It checks multiple sources
-// to avoid falsely flagging legitimate databases as orphans (gt-q8f6n):
+// collectMetadataDatabases returns the set of database names that are actually
+// named by some beads metadata.json dolt_database field. It checks multiple
+// sources so the result reflects real, served databases:
 //   - town-level .beads/metadata.json (HQ)
 //   - all rigs from rigs.json
 //   - all routes from routes.jsonl (catches rigs not yet in rigs.json)
 //   - broad scan of metadata.json files under town root
-func collectReferencedDatabases(townRoot string) map[string]bool {
+//
+// Unlike collectReferencedDatabases, this does NOT add rig *prefixes* as a
+// safety net, so every entry maps to a real database. This is the right basis
+// for the production-DB list used by health checks / pollution scans, which
+// issue `USE <db>` against the server — a prefix that is not a real database
+// triggers the historical ':3307 database not found' log spam (hq-pwfqv).
+func collectMetadataDatabases(townRoot string) map[string]bool {
 	referenced := make(map[string]bool)
 
 	// Check town-level beads (hq)
@@ -3150,6 +3157,23 @@ func collectReferencedDatabases(townRoot string) map[string]bool {
 		}
 	}
 
+	return referenced
+}
+
+// collectReferencedDatabases returns a set of database names referenced by
+// any rig's metadata.json dolt_database field. It checks multiple sources
+// to avoid falsely flagging legitimate databases as orphans (gt-q8f6n):
+//   - everything in collectMetadataDatabases (real dolt_database names)
+//   - all rig prefixes from rigs.json (safety net for missing/corrupt metadata)
+//
+// The prefix safety net deliberately makes this set over-inclusive: it is used
+// to decide what NOT to delete as an orphan, where a false positive (keeping a
+// real DB) is far cheaper than a false negative (deleting one). Callers that
+// must issue `USE <db>` should use ProductionDatabases instead, which omits
+// prefixes that aren't real databases.
+func collectReferencedDatabases(townRoot string) map[string]bool {
+	referenced := collectMetadataDatabases(townRoot)
+
 	// Safety net: also mark all rig prefixes from rigs.json as referenced.
 	// Some rigs use their prefix as the database name (e.g., "lc" for laneassist,
 	// "gt" for gastown). If metadata.json is missing or corrupted, the prefix-named
@@ -3159,6 +3183,39 @@ func collectReferencedDatabases(townRoot string) map[string]bool {
 	}
 
 	return referenced
+}
+
+// ProductionDatabases returns the sorted list of production Dolt database names
+// that should be health-checked and pollution-scanned: the town beads database
+// (hq) plus each registered rig's actual Dolt database. The list is derived
+// from the rig registry / beads metadata (collectMetadataDatabases) so it stays
+// correct as rigs are added or removed — no hardcoded set to drift.
+//
+// This replaces the historical hardcoded []string{"hq", "gt", "mo"} in the
+// health and doctor-dog paths. That set named "mo" (a reference-town rig that
+// does not exist here), so every enumeration issued `USE mo` and logged
+// 'database not found: mo (errno 1049)'; it also omitted real rigs such as
+// audry_games and beads. (hq-pwfqv)
+//
+// Only names that map to a real database are returned (prefixes are excluded),
+// so callers never `USE` a non-existent database. If the registry/metadata
+// cannot be read at all, falls back to the always-present town databases
+// {"hq", "gt"} rather than returning nothing.
+func ProductionDatabases(townRoot string) []string {
+	set := collectMetadataDatabases(townRoot)
+
+	if len(set) == 0 {
+		// Registry/metadata unreadable — fall back to the databases that always
+		// exist in a Gas Town workspace. Never includes "mo".
+		return []string{"gt", "hq"}
+	}
+
+	dbs := make([]string, 0, len(set))
+	for name := range set {
+		dbs = append(dbs, name)
+	}
+	sort.Strings(dbs)
+	return dbs
 }
 
 // CollectDatabaseOwners returns a map from database name to a human-readable
