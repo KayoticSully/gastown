@@ -1,7 +1,7 @@
 +++
 name = "stuck-agent-dog"
 description = "Context-aware stuck/crashed agent detection and restart for polecats and deacons"
-version = 1
+version = 2
 
 [gate]
 type = "cooldown"
@@ -234,13 +234,24 @@ For STUCK agents (session alive, agent dead):
 - Kill the zombie session, then restart
 - Exception: if pane output shows the agent is in a long-running build/test
 
-For DEACON stuck (stale heartbeat):
-- Capture pane output: `tmux capture-pane -t hq-deacon -p -S -20`
-- If output shows active work (recent timestamps, command output), the heartbeat
-  file may just be stale — nudge instead of kill
-- If output shows no recent activity, restart is warranted
-- Use a stable escalation fingerprint (`stuck-agent-dog:deacon:stuck-heartbeat`)
-  for stale-heartbeat events; do not include the age seconds in the fingerprint.
+For DEACON stuck/frozen/crashed (stale heartbeat, zombie, or dead session):
+- The Deacon is a **data-safe singleton**: it owns no git worktree and has no
+  work to lose, so it is ALWAYS safe to restart. The freeze root cause is the
+  Claude API / agent-harness layer (e.g. a 400 on thinking/redacted_thinking
+  blocks) which gastown cannot fix, and the manual recovery was invariably the
+  same trivial `gt deacon restart`.
+- **AUTO-RESTART instead of escalating to the Mayor** (`gt deacon restart`).
+- **RATE LIMIT** to avoid masking a genuine crash-loop: auto-restart up to N
+  times per rolling window (default 3/hour, tunable via
+  `STUCK_AGENT_DOG_DEACON_RESTART_MAX` / `STUCK_AGENT_DOG_DEACON_RESTART_WINDOW`).
+  If the Deacon re-freezes more often, auto-restart is not holding — THEN
+  escalate HIGH (`stuck-agent-dog:deacon:restart-loop`).
+- Rate-limit state lives in a plain timestamp log under
+  `<townRoot>/.runtime/stuck-agent-dog/deacon-restarts.log` so it survives
+  `bd mol wisp gc` and creates no Dolt commits (same pattern as plugin cooldowns).
+- Each auto-restart writes an audit bead (`action:deacon-auto-restart`) so the
+  frequency stays visible. If `gt deacon restart` itself fails, escalate HIGH
+  (`stuck-agent-dog:deacon:restart-failed`).
 
 **Decision framework:**
 1. If agent is clearly dead (no process, no output) → restart
@@ -295,12 +306,16 @@ BODY
 
 done
 
-# For deacon issues
+# For deacon issues — auto-restart (rate-limited), don't escalate.
+# The Deacon is a data-safe singleton; recovery is always `gt deacon restart`.
+# See run.sh for the authoritative implementation (rate-limit + audit bead).
 if [ -n "$DEACON_ISSUE" ]; then
-  echo "Escalating deacon issue: $DEACON_ISSUE"
-  gt escalate "Deacon $DEACON_ISSUE detected by stuck-agent-dog" \
-    -s HIGH \
-    --reason "Deacon issue: $DEACON_ISSUE. Context inspection completed."
+  DEACON_RESTART_MAX="${STUCK_AGENT_DOG_DEACON_RESTART_MAX:-3}"
+  DEACON_RESTART_WINDOW="${STUCK_AGENT_DOG_DEACON_RESTART_WINDOW:-3600}"
+  DEACON_RESTART_STATE="$TOWN_ROOT/.runtime/stuck-agent-dog/deacon-restarts.log"
+  # Count prior restarts in the rolling window; auto-restart if under the cap,
+  # otherwise escalate HIGH (restart-loop). Records an audit bead each time.
+  echo "Deacon $DEACON_ISSUE — auto-restart if under ${DEACON_RESTART_MAX}/$((DEACON_RESTART_WINDOW/60))m, else escalate HIGH"
 fi
 ```
 
