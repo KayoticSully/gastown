@@ -3380,23 +3380,22 @@ func TestProductionDatabases_Fallback(t *testing.T) {
 	}
 }
 
-// TestProductionDatabases_ExcludesPrefixes verifies that ProductionDatabases is
-// built from real dolt_database names only — a rig prefix that is not a real
-// database (and would trigger ':3307 database not found' on USE) is excluded,
-// unlike the over-inclusive collectReferencedDatabases used for orphan safety.
-func TestProductionDatabases_ExcludesPrefixes(t *testing.T) {
+// TestProductionDatabases_RealDatabasesOnly verifies that ProductionDatabases is
+// built from real dolt_database names only. A rig registered without a
+// metadata.json maps to no real database, so it must not appear — callers
+// `USE <db>` against the server, and a phantom name would re-introduce the
+// ':3307 database not found' log spam this fix removes (hq-pwfqv).
+func TestProductionDatabases_RealDatabasesOnly(t *testing.T) {
 	townRoot := t.TempDir()
 
-	// Rig is registered but has NO metadata.json — collectReferencedDatabases
-	// would add its prefix as a safety net, but ProductionDatabases must not,
-	// since "ghost" maps to no real database.
+	// "ghost" is registered but has NO metadata.json — it names no real database.
 	setupRigsJSON(t, townRoot, []string{"ghost"})
 	setupRigMetadata(t, townRoot, "hq", "hq")
 
 	got := ProductionDatabases(townRoot)
 	for _, db := range got {
 		if db == "ghost" {
-			t.Errorf("ProductionDatabases must exclude prefix-only rig 'ghost', got %v", got)
+			t.Errorf("ProductionDatabases must exclude metadata-less rig 'ghost', got %v", got)
 		}
 	}
 	if !slicesEqual(got, []string{"hq"}) {
