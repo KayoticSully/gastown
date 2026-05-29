@@ -3312,6 +3312,98 @@ func TestCollectReferencedDatabases_NoRigsJSON(t *testing.T) {
 	}
 }
 
+// slicesEqual reports whether two string slices have identical contents and order.
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestProductionDatabases_RealTown is the regression test for hq-pwfqv: a town
+// with rigs {audry_games, beads, gastown} must yield {audry_games, beads, gt, hq}
+// (gastown's Dolt DB is named "gt") and must NEVER include the bogus "mo".
+func TestProductionDatabases_RealTown(t *testing.T) {
+	townRoot := t.TempDir()
+
+	setupRigsJSON(t, townRoot, []string{"audry_games", "beads", "gastown"})
+	setupRigMetadata(t, townRoot, "hq", "hq")
+	setupRigMetadata(t, townRoot, "audry_games", "audry_games")
+	setupRigMetadata(t, townRoot, "beads", "beads")
+	setupRigMetadata(t, townRoot, "gastown", "gt")
+
+	got := ProductionDatabases(townRoot)
+	want := []string{"audry_games", "beads", "gt", "hq"} // sorted
+	if !slicesEqual(got, want) {
+		t.Errorf("ProductionDatabases = %v, want %v", got, want)
+	}
+	for _, db := range got {
+		if db == "mo" {
+			t.Errorf("ProductionDatabases must never contain 'mo', got %v", got)
+		}
+	}
+}
+
+// TestProductionDatabases_Sorted verifies the returned list is sorted regardless
+// of registry iteration order, so callers (and tests) get a stable result.
+func TestProductionDatabases_Sorted(t *testing.T) {
+	townRoot := t.TempDir()
+
+	setupRigsJSON(t, townRoot, []string{"zeta", "alpha"})
+	setupRigMetadata(t, townRoot, "hq", "hq")
+	setupRigMetadata(t, townRoot, "zeta", "zeta")
+	setupRigMetadata(t, townRoot, "alpha", "alpha")
+
+	got := ProductionDatabases(townRoot)
+	want := []string{"alpha", "hq", "zeta"}
+	if !slicesEqual(got, want) {
+		t.Errorf("ProductionDatabases = %v, want sorted %v", got, want)
+	}
+}
+
+// TestProductionDatabases_Fallback verifies that when the registry/metadata
+// cannot be read (empty town), we fall back to the always-present town
+// databases {"gt", "hq"} rather than returning nothing — and never "mo".
+func TestProductionDatabases_Fallback(t *testing.T) {
+	townRoot := t.TempDir()
+	// No rigs.json, no metadata — nothing to derive from.
+
+	got := ProductionDatabases(townRoot)
+	want := []string{"gt", "hq"} // sorted fallback
+	if !slicesEqual(got, want) {
+		t.Errorf("ProductionDatabases fallback = %v, want %v", got, want)
+	}
+}
+
+// TestProductionDatabases_ExcludesPrefixes verifies that ProductionDatabases is
+// built from real dolt_database names only — a rig prefix that is not a real
+// database (and would trigger ':3307 database not found' on USE) is excluded,
+// unlike the over-inclusive collectReferencedDatabases used for orphan safety.
+func TestProductionDatabases_ExcludesPrefixes(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Rig is registered but has NO metadata.json — collectReferencedDatabases
+	// would add its prefix as a safety net, but ProductionDatabases must not,
+	// since "ghost" maps to no real database.
+	setupRigsJSON(t, townRoot, []string{"ghost"})
+	setupRigMetadata(t, townRoot, "hq", "hq")
+
+	got := ProductionDatabases(townRoot)
+	for _, db := range got {
+		if db == "ghost" {
+			t.Errorf("ProductionDatabases must exclude prefix-only rig 'ghost', got %v", got)
+		}
+	}
+	if !slicesEqual(got, []string{"hq"}) {
+		t.Errorf("ProductionDatabases = %v, want [hq]", got)
+	}
+}
+
 func TestRemoveDatabase_RemovesDirectory(t *testing.T) {
 	townRoot := t.TempDir()
 	dataDir := filepath.Join(townRoot, ".dolt-data")

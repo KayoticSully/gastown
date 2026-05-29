@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
 // Operational constants — timeouts needed to perform checks.
@@ -80,13 +81,19 @@ func doctorDogInterval(config *DaemonPatrolConfig) time.Duration {
 }
 
 // doctorDogDatabases returns the list of production databases for health checks.
-func doctorDogDatabases(config *DaemonPatrolConfig) []string {
+// An explicit config.Patrols.DoctorDog.Databases override always wins. Otherwise
+// the list is derived from the rig registry via doltserver.ProductionDatabases so
+// it stays correct as rigs are added/removed. This replaces the historical
+// hardcoded []string{"hq", "gt", "mo"} — "mo" is a reference-town rig that does
+// not exist here, so each enumeration logged 'database not found: mo', and the
+// set omitted real rigs such as audry_games and beads (hq-pwfqv).
+func doctorDogDatabases(config *DaemonPatrolConfig, townRoot string) []string {
 	if config != nil && config.Patrols != nil && config.Patrols.DoctorDog != nil {
 		if len(config.Patrols.DoctorDog.Databases) > 0 {
 			return config.Patrols.DoctorDog.Databases
 		}
 	}
-	return []string{"hq", "gt", "mo"}
+	return doltserver.ProductionDatabases(townRoot)
 }
 
 // runDoctorDog pours a mol-dog-doctor molecule for agent execution.

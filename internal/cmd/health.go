@@ -119,12 +119,12 @@ func runHealth(cmd *cobra.Command, args []string) error {
 
 	// 2. Databases (only if server is running)
 	if report.Server.Running {
-		report.Databases = checkDatabaseHealth(report.Server.Port)
+		report.Databases = checkDatabaseHealth(townRoot, report.Server.Port)
 	}
 
 	// 3. Pollution scan
 	if report.Server.Running {
-		report.Pollution = checkPollution(report.Server.Port)
+		report.Pollution = checkPollution(townRoot, report.Server.Port)
 	}
 
 	// 4. Backups
@@ -177,8 +177,8 @@ func checkServerHealth(townRoot string) *ServerHealth {
 	return sh
 }
 
-func checkDatabaseHealth(port int) []DatabaseHealth {
-	productionDBs := []string{"hq", "gt", "mo"}
+func checkDatabaseHealth(townRoot string, port int) []DatabaseHealth {
+	productionDBs := doltserver.ProductionDatabases(townRoot)
 	var results []DatabaseHealth
 
 	for _, dbName := range productionDBs {
@@ -218,8 +218,8 @@ func checkDatabaseHealth(port int) []DatabaseHealth {
 	return results
 }
 
-func checkPollution(port int) []PollutionRecord {
-	productionDBs := []string{"hq", "gt", "mo"}
+func checkPollution(townRoot string, port int) []PollutionRecord {
+	productionDBs := doltserver.ProductionDatabases(townRoot)
 	var records []PollutionRecord
 
 	// Known pollution patterns to check in the issues table.
