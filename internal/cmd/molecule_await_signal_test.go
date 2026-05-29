@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/deacon"
 )
 
 func TestCalculateEffectiveTimeout(t *testing.T) {
@@ -305,5 +307,71 @@ func TestBackoffWindowResumption(t *testing.T) {
 				t.Errorf("timeout = %v, want ~%v (diff: %v)", timeout, tt.wantApproxTime, diff)
 			}
 		})
+	}
+}
+
+func TestIsDeaconStandby(t *testing.T) {
+	orig, had := os.LookupEnv("GT_ROLE")
+	t.Cleanup(func() {
+		if had {
+			_ = os.Setenv("GT_ROLE", orig)
+		} else {
+			_ = os.Unsetenv("GT_ROLE")
+		}
+	})
+
+	cases := []struct {
+		role string
+		want bool
+	}{
+		{"deacon", true},
+		{"deacon/boot", false}, // Boot is deacon-family but not the standby loop
+		{"witness", false},
+		{"gastown/polecats/topaz", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		_ = os.Setenv("GT_ROLE", c.role)
+		if got := isDeaconStandby(); got != c.want {
+			t.Errorf("isDeaconStandby() with GT_ROLE=%q = %v, want %v", c.role, got, c.want)
+		}
+	}
+}
+
+func TestStartDeaconStandbyHeartbeat_RefreshesAndStops(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Immediate refresh on start: heartbeat.json should exist and be fresh
+	// before any tick fires.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stop := startDeaconStandbyHeartbeat(ctx, townRoot)
+
+	hb := deacon.ReadHeartbeat(townRoot)
+	if hb == nil {
+		t.Fatal("expected heartbeat.json to be written immediately on standby start")
+	}
+	if !hb.IsFresh() {
+		t.Errorf("heartbeat should be fresh immediately after start, age = %v", hb.Age())
+	}
+
+	// stop() must be idempotent and must not panic when called more than once.
+	stop()
+	stop()
+}
+
+func TestStartDeaconStandbyHeartbeat_StopsOnContextCancel(t *testing.T) {
+	townRoot := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	stop := startDeaconStandbyHeartbeat(ctx, townRoot)
+	defer stop()
+
+	// Canceling the context should terminate the ticker goroutine without
+	// needing the explicit stop(). We can't easily observe goroutine exit, but
+	// we can confirm cancel() is safe and the initial heartbeat was written.
+	cancel()
+	if hb := deacon.ReadHeartbeat(townRoot); hb == nil {
+		t.Fatal("expected heartbeat.json after start")
 	}
 }

@@ -1196,6 +1196,12 @@ gt mol step await-signal --agent-bead hq-deacon \
   --backoff-base 60s --backoff-mult 2 --backoff-max 15m
 ```
 
+NOTE: While the Deacon blocks in await-signal, it refreshes
+`deacon/heartbeat.json` automatically on a 2-minute ticker (mechanical liveness,
+hq-zifl3). You do NOT need to remember to heartbeat during standby — the
+`gt deacon heartbeat` above is a belt-and-suspenders checkpoint, not the only
+safeguard against a stale heartbeat.
+
 This command:
 1. Subscribes to `bd activity --follow` (beads activity feed)
 2. Returns IMMEDIATELY when any beads activity occurs
