@@ -205,21 +205,83 @@ action: restart requested
 BODY
 done
 
-# Deacon issues: escalate
+# Deacon recovery: auto-restart (rate-limited) instead of escalating to Mayor.
+#
+# The Deacon is a data-safe singleton — it owns no git worktree and has no work
+# to lose, so a stuck/frozen/crashed Deacon is ALWAYS safe to restart. The root
+# cause is usually the Claude API / agent-harness layer (e.g. a 400 on
+# thinking/redacted_thinking blocks) which gastown cannot fix, and the manual
+# recovery is invariably the same trivial `gt deacon restart`. So make recovery
+# automatic here instead of generating repeated HIGH-escalation + manual toil.
+#
+# RATE LIMIT: auto-restart up to N times per rolling window (default 3/hour). If
+# the Deacon re-freezes more often than that, auto-restart is not holding (a
+# genuine crash-loop / backend problem) — escalate HIGH to the Mayor instead.
+DEACON_RESTART_MAX="${STUCK_AGENT_DOG_DEACON_RESTART_MAX:-3}"
+DEACON_RESTART_WINDOW="${STUCK_AGENT_DOG_DEACON_RESTART_WINDOW:-3600}"
+DEACON_RESTART_STATE="$TOWN_ROOT/.runtime/stuck-agent-dog/deacon-restarts.log"
+
 if [ -n "$DEACON_ISSUE" ]; then
-	log "Escalating deacon issue: $DEACON_ISSUE"
-	DEACON_SEVERITY="HIGH"
-	DEACON_FINGERPRINT="stuck-agent-dog:deacon:$DEACON_ISSUE"
-	case "$DEACON_ISSUE" in
-		stuck_heartbeat_*)
-			DEACON_SEVERITY="MEDIUM"
-			DEACON_FINGERPRINT="stuck-agent-dog:deacon:stuck-heartbeat"
-			;;
-	esac
-	gt escalate "Deacon $DEACON_ISSUE detected by stuck-agent-dog" \
-		-s "$DEACON_SEVERITY" \
-		--source "plugin:stuck-agent-dog" \
-		--fingerprint "$DEACON_FINGERPRINT" 2>/dev/null || true
+	NOW=$(date +%s)
+	WINDOW_START=$(( NOW - DEACON_RESTART_WINDOW ))
+	WINDOW_MIN=$(( DEACON_RESTART_WINDOW / 60 ))
+
+	# Count + prune prior auto-restarts within the rolling window. The state
+	# file is a plain newline-delimited list of epoch timestamps under
+	# .runtime/ so it survives `bd mol wisp gc` and creates no Dolt commits
+	# (same durable-state pattern as plugin cooldowns, hq-1o1).
+	RECENT_RESTARTS=()
+	if [ -f "$DEACON_RESTART_STATE" ]; then
+		while IFS= read -r ts; do
+			[ -z "$ts" ] && continue
+			if [ "$ts" -ge "$WINDOW_START" ] 2>/dev/null; then
+				RECENT_RESTARTS+=("$ts")
+			fi
+		done < "$DEACON_RESTART_STATE"
+	fi
+	RESTART_COUNT=${#RECENT_RESTARTS[@]}
+
+	if [ "$RESTART_COUNT" -ge "$DEACON_RESTART_MAX" ]; then
+		# Rate limit hit — auto-restart is not holding. Escalate HIGH.
+		log "Deacon $DEACON_ISSUE: auto-restart rate limit hit (${RESTART_COUNT}/${DEACON_RESTART_MAX} in last ${WINDOW_MIN}m) — escalating HIGH"
+		gt escalate "Deacon re-froze ${RESTART_COUNT}x in ${WINDOW_MIN}m — auto-restart not holding, needs investigation/backend swap" \
+			-s HIGH \
+			--source "plugin:stuck-agent-dog" \
+			--fingerprint "stuck-agent-dog:deacon:restart-loop" 2>/dev/null || true
+	else
+		# Data-safe singleton: auto-restart instead of escalating to Mayor.
+		ATTEMPT=$(( RESTART_COUNT + 1 ))
+		log "Deacon $DEACON_ISSUE: auto-restarting (data-safe, attempt ${ATTEMPT}/${DEACON_RESTART_MAX} in last ${WINDOW_MIN}m)"
+		if gt deacon restart 2>&1 | sed 's/^/[stuck-agent-dog]   /'; then
+			RESTART_OK=1
+		else
+			RESTART_OK=0
+		fi
+
+		# Record this attempt (in-window history + now) for the next cycle's
+		# rate-limit check. Write atomically via a temp file.
+		mkdir -p "$(dirname "$DEACON_RESTART_STATE")" 2>/dev/null || true
+		{
+			for ts in ${RECENT_RESTARTS[@]+"${RECENT_RESTARTS[@]}"}; do echo "$ts"; done
+			echo "$NOW"
+		} > "$DEACON_RESTART_STATE.tmp" 2>/dev/null \
+			&& mv "$DEACON_RESTART_STATE.tmp" "$DEACON_RESTART_STATE" 2>/dev/null || true
+
+		# Audit bead so auto-restart frequency stays visible (hq-l2msx).
+		bd create "stuck-agent-dog: auto-restarted Deacon ($DEACON_ISSUE)" -t chore --ephemeral \
+			-l type:plugin-action,plugin:stuck-agent-dog,action:deacon-auto-restart \
+			-d "Auto-restarted Deacon (issue=$DEACON_ISSUE, attempt ${ATTEMPT}/${DEACON_RESTART_MAX} in last ${WINDOW_MIN}m, restart_ok=${RESTART_OK}). Data-safe singleton recovery; no Mayor escalation. See hq-l2msx." \
+			--silent 2>/dev/null || true
+
+		if [ "$RESTART_OK" -ne 1 ]; then
+			# The restart command itself failed — that IS a real problem.
+			log "Deacon auto-restart command FAILED — escalating HIGH"
+			gt escalate "Deacon auto-restart FAILED ($DEACON_ISSUE) — 'gt deacon restart' returned error" \
+				-s HIGH \
+				--source "plugin:stuck-agent-dog" \
+				--fingerprint "stuck-agent-dog:deacon:restart-failed" 2>/dev/null || true
+		fi
+	fi
 fi
 
 # --- Report -------------------------------------------------------------------
