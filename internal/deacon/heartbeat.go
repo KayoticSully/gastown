@@ -147,6 +147,26 @@ func Touch(townRoot string) error {
 	})
 }
 
+// RefreshHeartbeat updates only the heartbeat timestamp, preserving the
+// existing cycle number, last action, and agent counts.
+//
+// Unlike Touch (which increments the cycle, signalling a new wake cycle), a
+// refresh is a pure liveness signal: it proves the Deacon process is still
+// alive and progressing through its current cycle without claiming a new one.
+// This is used to keep deacon/heartbeat.json fresh during long event-driven
+// standby (e.g. the await-signal backoff sleep), where the Deacon is healthy
+// but not actively running patrol steps. See hq-zifl3.
+//
+// If no heartbeat exists yet, it writes a minimal one (cycle 1).
+func RefreshHeartbeat(townRoot string) error {
+	existing := ReadHeartbeat(townRoot)
+	if existing == nil {
+		existing = &Heartbeat{Cycle: 1}
+	}
+	existing.Timestamp = time.Now().UTC()
+	return WriteHeartbeat(townRoot, existing)
+}
+
 // TouchWithAction writes a heartbeat with an action description.
 func TouchWithAction(townRoot, action string, healthy, unhealthy int) error {
 	existing := ReadHeartbeat(townRoot)

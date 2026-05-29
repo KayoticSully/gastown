@@ -10,11 +10,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -222,6 +225,21 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
+	// Mechanical Deacon liveness (hq-zifl3): while the Deacon blocks here during
+	// event-driven standby, keep deacon/heartbeat.json fresh on a ticker. The
+	// heartbeat file is what the stuck-agent-dog plugin and the daemon read to
+	// decide whether the Deacon is stuck. Previously it only got refreshed when
+	// the Deacon *remembered* to run `gt deacon heartbeat`; during a long
+	// await-signal backoff sleep (up to backoff-max) it would go stale and
+	// trigger false-positive HIGH escalations. await-signal actively running in
+	// the Deacon process IS the liveness signal — no agent action required.
+	// Bounded by the backoff timeout: a genuinely hung Deacon that stops looping
+	// still goes stale and escalates correctly, so this does not mask real stalls.
+	if isDeaconStandby() {
+		stopHeartbeat := startDeaconStandbyHeartbeat(ctx, townRoot)
+		defer stopHeartbeat()
+	}
+
 	result, err := waitForActivitySignal(ctx, townRoot)
 	if err != nil {
 		return fmt.Errorf("feed subscription failed: %w", err)
@@ -313,6 +331,48 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// deaconStandbyHeartbeatInterval is how often deacon/heartbeat.json is
+// refreshed while the Deacon blocks in await-signal. Well under the 5-minute
+// stale threshold so the daemon and stuck-agent-dog always read a fresh
+// heartbeat during legitimate standby. See hq-zifl3.
+const deaconStandbyHeartbeatInterval = 2 * time.Minute
+
+// isDeaconStandby reports whether the current process is the Deacon's
+// event-driven standby loop. Gated strictly on the deacon role so that
+// await-signal invocations by other agents (witness, polecats, Boot) never
+// touch the Deacon's heartbeat file.
+func isDeaconStandby() bool {
+	return os.Getenv("GT_ROLE") == string(session.RoleDeacon)
+}
+
+// startDeaconStandbyHeartbeat refreshes deacon/heartbeat.json immediately and
+// then on a ticker until ctx is canceled or the returned stop func is called.
+// Failures are best-effort and intentionally ignored: a transient heartbeat
+// write error must not interrupt the Deacon's standby wait.
+func startDeaconStandbyHeartbeat(ctx context.Context, townRoot string) func() {
+	// Refresh immediately so the heartbeat is fresh the moment standby begins.
+	_ = deacon.RefreshHeartbeat(townRoot)
+
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(deaconStandbyHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				_ = deacon.RefreshHeartbeat(townRoot)
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() { once.Do(func() { close(done) }) }
 }
 
 // calculateEffectiveTimeout determines the timeout based on flags.

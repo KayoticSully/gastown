@@ -299,6 +299,75 @@ func TestTouchWithAction(t *testing.T) {
 	}
 }
 
+func TestRefreshHeartbeat_CreatesWhenMissing(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "deacon-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	if err := RefreshHeartbeat(tmpDir); err != nil {
+		t.Fatalf("RefreshHeartbeat error: %v", err)
+	}
+
+	hb := ReadHeartbeat(tmpDir)
+	if hb == nil {
+		t.Fatal("expected heartbeat after RefreshHeartbeat")
+	}
+	if hb.Cycle != 1 {
+		t.Errorf("Cycle = %d, want 1 when created fresh", hb.Cycle)
+	}
+	if !hb.IsFresh() {
+		t.Errorf("refreshed heartbeat should be fresh, age = %v", hb.Age())
+	}
+}
+
+func TestRefreshHeartbeat_PreservesFields(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "deacon-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	// Seed a heartbeat with meaningful fields and an old timestamp.
+	old := time.Now().Add(-30 * time.Minute).UTC()
+	if err := WriteHeartbeat(tmpDir, &Heartbeat{
+		Timestamp:       old,
+		Cycle:           7,
+		LastAction:      "health scan",
+		HealthyAgents:   5,
+		UnhealthyAgents: 2,
+	}); err != nil {
+		t.Fatalf("WriteHeartbeat error: %v", err)
+	}
+
+	if err := RefreshHeartbeat(tmpDir); err != nil {
+		t.Fatalf("RefreshHeartbeat error: %v", err)
+	}
+
+	hb := ReadHeartbeat(tmpDir)
+	if hb == nil {
+		t.Fatal("expected heartbeat after RefreshHeartbeat")
+	}
+	// Timestamp must advance (no longer stale).
+	if !hb.IsFresh() {
+		t.Errorf("refreshed heartbeat should be fresh, age = %v", hb.Age())
+	}
+	// Cycle must NOT be incremented — refresh is liveness, not a new wake cycle.
+	if hb.Cycle != 7 {
+		t.Errorf("Cycle = %d, want 7 (preserved, not incremented)", hb.Cycle)
+	}
+	if hb.LastAction != "health scan" {
+		t.Errorf("LastAction = %q, want preserved 'health scan'", hb.LastAction)
+	}
+	if hb.HealthyAgents != 5 {
+		t.Errorf("HealthyAgents = %d, want preserved 5", hb.HealthyAgents)
+	}
+	if hb.UnhealthyAgents != 2 {
+		t.Errorf("UnhealthyAgents = %d, want preserved 2", hb.UnhealthyAgents)
+	}
+}
+
 func TestWriteHeartbeat_CreatesDirectory(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "deacon-test-*")
 	if err != nil {
