@@ -276,25 +276,20 @@ func TestDrainSkipsExpired(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-test-expired"
 
-	// Enqueue an already-expired nudge
-	expired := QueuedNudge{
-		Sender:    "old-sender",
-		Message:   "stale message",
-		Timestamp: time.Now().Add(-time.Hour),
-		ExpiresAt: time.Now().Add(-30 * time.Minute), // expired 30 min ago
+	// Write both entries directly to disk so we exercise Drain's expiry
+	// handling in isolation. (Enqueue evicts expired entries on write, so we
+	// can't stage an expired nudge through it.)
+	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
 	}
-	if err := Enqueue(townRoot, session, expired); err != nil {
-		t.Fatalf("Enqueue expired: %v", err)
+	expiredJSON := `{"sender":"old-sender","message":"stale message","expires_at":"2000-01-01T00:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(dir, "100.json"), []byte(expiredJSON), 0644); err != nil {
+		t.Fatal(err)
 	}
-
-	// Enqueue a fresh nudge
-	time.Sleep(time.Millisecond)
-	fresh := QueuedNudge{
-		Sender:  "new-sender",
-		Message: "fresh message",
-	}
-	if err := Enqueue(townRoot, session, fresh); err != nil {
-		t.Fatalf("Enqueue fresh: %v", err)
+	freshJSON := `{"sender":"new-sender","message":"fresh message"}`
+	if err := os.WriteFile(filepath.Join(dir, "200.json"), []byte(freshJSON), 0644); err != nil {
+		t.Fatal(err)
 	}
 
 	// Pending counts both (doesn't check expiry)
@@ -319,7 +314,6 @@ func TestDrainSkipsExpired(t *testing.T) {
 	}
 
 	// After drain, queue dir should be empty (both files removed)
-	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 0 {
 		t.Errorf("queue dir should be empty after drain, got %d entries", len(entries))
@@ -372,6 +366,123 @@ func TestEnqueueQueueDepthLimit(t *testing.T) {
 	err = Enqueue(townRoot, session, overflow)
 	if err != nil {
 		t.Errorf("Enqueue after drain should succeed: %v", err)
+	}
+}
+
+// TestEnqueueEvictsExpiredWhenFull verifies the hq-73ua fix: a queue filled to
+// the cap entirely with expired entries must not reject a fresh inbound nudge.
+// Expired entries are evicted on enqueue so the cap reflects only live messages.
+func TestEnqueueEvictsExpiredWhenFull(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-evict-on-enqueue"
+
+	// Fill the queue to the cap with already-expired nudges.
+	for i := 0; i < MaxQueueDepth; i++ {
+		expired := QueuedNudge{
+			Sender:    "old-sender",
+			Message:   "stale",
+			Timestamp: time.Now().Add(-time.Hour),
+			ExpiresAt: time.Now().Add(-30 * time.Minute), // expired 30 min ago
+		}
+		if err := Enqueue(townRoot, session, expired); err != nil {
+			t.Fatalf("Enqueue expired %d: %v", i, err)
+		}
+	}
+
+	// A fresh nudge must succeed — expired entries should be evicted to make room.
+	fresh := QueuedNudge{Sender: "new-sender", Message: "fresh inbound"}
+	if err := Enqueue(townRoot, session, fresh); err != nil {
+		t.Fatalf("Enqueue fresh into expired-full queue should succeed, got: %v", err)
+	}
+
+	// Only the fresh nudge should survive a drain.
+	nudges, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(nudges) != 1 {
+		t.Fatalf("Drain returned %d nudges, want 1 (expired evicted, fresh kept)", len(nudges))
+	}
+	if nudges[0].Sender != "new-sender" {
+		t.Errorf("got sender %q, want %q", nudges[0].Sender, "new-sender")
+	}
+}
+
+// TestEnqueueStillRejectsWhenFullOfLiveEntries verifies eviction does not
+// weaken the runaway-sender guard: a queue full of live (unexpired) nudges
+// still rejects new ones.
+func TestEnqueueStillRejectsWhenFullOfLiveEntries(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-evict-live-full"
+
+	for i := 0; i < MaxQueueDepth; i++ {
+		if err := Enqueue(townRoot, session, QueuedNudge{Sender: "s", Message: "live"}); err != nil {
+			t.Fatalf("Enqueue %d: %v", i, err)
+		}
+	}
+
+	err := Enqueue(townRoot, session, QueuedNudge{Sender: "s", Message: "overflow"})
+	if err == nil {
+		t.Fatal("expected error when queue is full of live entries")
+	}
+	if !strings.Contains(err.Error(), "is full") {
+		t.Errorf("got error %q, want to contain 'is full'", err.Error())
+	}
+}
+
+// TestEvictExpired verifies EvictExpired removes only past-expiry .json entries,
+// leaving live, non-expiring, and in-flight .claimed files untouched.
+func TestEvictExpired(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-evict-fn"
+
+	// Enqueue a live nudge normally.
+	live := QueuedNudge{Sender: "new", Message: "live"} // default TTL, not expired
+	if err := Enqueue(townRoot, session, live); err != nil {
+		t.Fatalf("Enqueue live: %v", err)
+	}
+
+	// Write an expired entry directly to disk. (Enqueue would evict it itself,
+	// so we place it directly to exercise EvictExpired in isolation.)
+	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
+	expiredJSON := `{"sender":"old","message":"expired","expires_at":"2000-01-01T00:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(dir, "100.json"), []byte(expiredJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drop an in-flight .claimed file — eviction must not touch it.
+	claimPath := filepath.Join(dir, "999.json.claimed.deadbeef")
+	if err := os.WriteFile(claimPath, []byte(`{"sender":"inflight"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	evicted, err := EvictExpired(townRoot, session)
+	if err != nil {
+		t.Fatalf("EvictExpired: %v", err)
+	}
+	if evicted != 1 {
+		t.Errorf("evicted = %d, want 1", evicted)
+	}
+
+	// Live nudge survives; expired gone; claimed untouched.
+	pending, _ := Pending(townRoot, session)
+	if pending != 1 {
+		t.Errorf("Pending = %d, want 1 (only the live nudge)", pending)
+	}
+	if _, err := os.Stat(claimPath); os.IsNotExist(err) {
+		t.Error("in-flight .claimed file should not be evicted")
+	}
+}
+
+// TestEvictExpiredNonexistentDir verifies EvictExpired is a no-op (no error) on
+// a queue directory that does not exist yet.
+func TestEvictExpiredNonexistentDir(t *testing.T) {
+	evicted, err := EvictExpired(t.TempDir(), "never-created")
+	if err != nil {
+		t.Fatalf("EvictExpired on nonexistent dir should not error: %v", err)
+	}
+	if evicted != 0 {
+		t.Errorf("evicted = %d, want 0", evicted)
 	}
 }
 
