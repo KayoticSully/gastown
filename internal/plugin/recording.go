@@ -97,12 +97,19 @@ func (r *Recorder) RecordRun(record PluginRunRecord) (string, error) {
 		return "", fmt.Errorf("parsing bd create output: %w", err)
 	}
 
-	// Close the receipt immediately — it exists for audit/cooldown-gate queries
+	// Close the receipt immediately — it exists for audit/history queries
 	// (which use --all to include closed beads) but should not stay open.
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), constants.BdCommandTimeout)
 	defer closeCancel()
 	closeCmd := beads.CommandContext(closeCtx, r.townRoot, townBeads, beads.MutationPinned, "close", result.ID, "--reason", "plugin run recorded")
 	_ = closeCmd.Run() // Best-effort — reaper will catch it if this fails
+
+	// Record the durable cooldown timestamp. The closed receipt above is the
+	// audit trail, but it gets deleted by `bd mol wisp gc --closed` (run every
+	// patrol cycle), which would reset the cooldown gate. The durable file
+	// under .runtime/ survives GC so the gate stays honored. Best-effort:
+	// failures fall back to the receipt-based query. See hq-1o1.
+	_ = recordCooldownState(r.townRoot, record.PluginName, time.Now())
 
 	return result.ID, nil
 }
@@ -212,8 +219,31 @@ func (r *Recorder) queryRuns(pluginName string, limit int, since string) ([]*Plu
 }
 
 // CountRunsSince returns the count of runs for a plugin since the given duration.
-// This is useful for cooldown gate evaluation.
+// This is the cooldown gate evaluation path used by both `gt plugin run` and
+// the daemon plugin runner; callers only check whether the result is > 0.
+//
+// The durable cooldown state (under .runtime/) is consulted first because it
+// survives `bd mol wisp gc --closed`, which deletes the ephemeral receipt beads
+// the bead query relies on. If the durable record shows a run within the
+// window, the gate is satisfied. When no durable record exists (e.g. a run
+// predating this mechanism), it falls back to the receipt-based query. See
+// hq-1o1.
 func (r *Recorder) CountRunsSince(pluginName string, since string) (int, error) {
+	if since != "" {
+		if last, ok := lastCooldownState(r.townRoot, pluginName); ok {
+			d, err := time.ParseDuration(since)
+			if err != nil {
+				return 0, fmt.Errorf("parsing duration %q: %w", since, err)
+			}
+			if time.Since(last) < d {
+				return 1, nil
+			}
+			// Durable record exists but is older than the window: the plugin is
+			// out of cooldown. Fall through to the receipt query as a backstop
+			// in case un-GC'd receipts hold a more recent run.
+		}
+	}
+
 	runs, err := r.GetRunsSince(pluginName, since)
 	if err != nil {
 		return 0, err
