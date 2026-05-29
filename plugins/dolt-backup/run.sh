@@ -54,6 +54,16 @@ log() {
   echo "[dolt-backup] $*"
 }
 
+# backup_is_registered checks whether a named backup remote exists for the repo
+# in $1. `dolt backup` (no args) lists registered backups, one per line; we match
+# the first field (the name) exactly. Mirrors the daemon's hasBackupRemote (Go).
+# Without this check, `dolt backup sync <name>` on an unregistered target logs a
+# spurious "backup '<name>' not found" warning to dolt.log every run.
+backup_is_registered() {
+  local db_dir="$1" name="$2"
+  (cd "$db_dir" && dolt backup 2>/dev/null) | awk '{print $1}' | grep -qxF "$name"
+}
+
 # --- Step 1: Discover databases -----------------------------------------------
 
 # Use explicit list if provided, otherwise auto-discover by scanning
@@ -87,6 +97,8 @@ SYNCED=0
 SKIPPED=0
 FAILED=0
 FAILED_DBS=""
+UNREGISTERED=0
+UNREGISTERED_DBS=""
 
 for DB in "${PROD_DBS[@]}"; do
   DB_DIR="$DOLT_DATA_DIR/$DB"
@@ -98,6 +110,17 @@ for DB in "${PROD_DBS[@]}"; do
     log "  $DB: no .dolt directory, skipping"
     FAILED=$((FAILED + 1))
     FAILED_DBS="$FAILED_DBS $DB(no-dir)"
+    continue
+  fi
+
+  # Skip databases with no registered backup remote. Attempting to sync an
+  # unregistered target only logs a spurious "backup not found" warning to
+  # dolt.log without protecting any data, so treat it as a config gap (not a
+  # failure — failures escalate, and an unconfigured target shouldn't spam).
+  if ! backup_is_registered "$DB_DIR" "$BACKUP_NAME"; then
+    log "  $DB: no backup remote '$BACKUP_NAME' registered, skipping (register with: dolt backup add $BACKUP_NAME <url>)"
+    UNREGISTERED=$((UNREGISTERED + 1))
+    UNREGISTERED_DBS="$UNREGISTERED_DBS $DB"
     continue
   fi
 
@@ -130,8 +153,12 @@ for DB in "${PROD_DBS[@]}"; do
   log "  $DB: syncing ($LAST_HASH -> $CURRENT_HASH)..."
   SYNC_START=$(date +%s)
 
-  SYNC_OUTPUT=$(cd "$DB_DIR" && timeout "$BACKUP_TIMEOUT" dolt backup sync "$BACKUP_NAME" 2>&1) || true
-  SYNC_RC=${PIPESTATUS[0]:-$?}
+  # Capture the REAL exit code of the sync. The previous `... || true` followed
+  # by `${PIPESTATUS[0]:-$?}` always yielded 0 (PIPESTATUS reflected the `true`),
+  # so every failed sync was silently recorded as a success: the hash was written
+  # and no escalation fired. This `&& rc=0 || rc=$?` idiom captures output without
+  # tripping `set -e` while preserving the actual return code.
+  SYNC_OUTPUT=$(cd "$DB_DIR" && timeout "$BACKUP_TIMEOUT" dolt backup sync "$BACKUP_NAME" 2>&1) && SYNC_RC=0 || SYNC_RC=$?
   SYNC_ELAPSED=$(( $(date +%s) - SYNC_START ))
 
   if [[ $SYNC_RC -eq 0 ]]; then
@@ -155,8 +182,11 @@ done
 
 # --- Step 3: Report results ---------------------------------------------------
 
-SUMMARY="Backup: $SYNCED synced, $SKIPPED unchanged, $FAILED failed (of ${#PROD_DBS[@]} DBs)"
+SUMMARY="Backup: $SYNCED synced, $SKIPPED unchanged, $UNREGISTERED unregistered, $FAILED failed (of ${#PROD_DBS[@]} DBs)"
 log "$SUMMARY"
+if [[ "$UNREGISTERED" -gt 0 ]]; then
+  log "Unregistered (no backup remote, not protected by dolt backup):$UNREGISTERED_DBS"
+fi
 
 # --- Step 4: Record result and escalate if needed -----------------------------
 
